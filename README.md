@@ -28,7 +28,7 @@ ids are declared ahead of their classes.
 
 **Platforms proven:** macOS arm64 (Apple Silicon) only. Windows is unproven.
 
-**Evidence:** `tests/darkbase/` owners and `tests/test-checklist.md`. This is a
+**Evidence:** `../../tests/darkbase` owners and `../../gist/test-checklist.md`. This is a
 lab pass, not a visual or cross-platform claim.
 
 ## What it is
@@ -97,19 +97,19 @@ Database semantics and persistence remain Darkbase R3.
 ## Layout
 
 - `src/darkbase/type.h` — the class registry (`PROJ_DARKBASE`, 1..N).
-- `src/database/` — the L2 `Database` interface, entity/row switchboard, dest-last
+- `src/database` — the L2 `Database` interface, entity/row switchboard, dest-last
   cursor and `.vexdb` persistence (implemented: `database.{h,c}`,
   `database_result.{h,c}`).
 - `src/schema/` — registration over reflection `Struct`/`Field`/`Class` (future).
 - `src/store/`, `src/codec/`, `src/index/`, `src/tx/`, `src/export/` (future).
-- `drivers/` — quarantined external driver dylibs (future: sqlite, postgres, ...).
-- Tests: the shared `../../../tests/darkbase/` partition (mirrored per unit, the
+- `..` — quarantined external driver dylibs (future: sqlite, postgres, ...).
+- Tests: the shared `../../tests/darkbase` partition (mirrored per unit, the
   Test Tree Mirror Law); no test file lives inside this repo's source
   directories (the Test Segregation Law).
 
 ## Laws that govern work here
 
-- Constitution: the [canonical preferences.md Gist](https://gist.github.com/vex-graph/4132a6c45cb6d3797c3e8eff2e94035a); one real, Git-ignored workspace-root `../../../preferences.md`, not a Vexspoke file or symlink.
+- Constitution: the [canonical preferences.md Gist](https://gist.github.com/vex-graph/4132a6c45cb6d3797c3e8eff2e94035a); one real, Git-ignored workspace `../../gist/PREFERENCES.md`, not a Vexspoke file or symlink.
 - Commits land in THIS repo root, one cohesive unit each; never push unless asked.
 - One public class per `.h`/`.c` pair, `(*ptr).field` (never `->`), dest-last
   params, `-Wall -Wextra -Werror`.
