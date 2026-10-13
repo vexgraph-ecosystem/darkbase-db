@@ -21,7 +21,7 @@ Build with [b](https://github.com/vex-graph/b):
   and corrupted-checksum atomicity are covered by `database_test`.
 
 **Stubbed, draft, or planned:** field-level predicates and an offset-based codec;
-an mmap/paged store (waits on the Relational Engine `MappedFile` primitive);
+an mmap/paged store (waits on the Relational Engine `FixedMappedFile` primitive);
 transactions/WAL; CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry
 ids are declared ahead of their classes.
