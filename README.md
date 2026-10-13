@@ -3,6 +3,8 @@
 Build with [b](https://github.com/vex-graph/b):
 `./tools/b build darkbase` from the workspace root.
 
+Store format (specified, not implemented): [`docs/store-format.md`](docs/store-format.md).
+
 ## Current State
 
 **Role:** R3 Driver — the `Database` interface owner and its native vex store
