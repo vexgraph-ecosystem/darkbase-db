@@ -5,9 +5,8 @@
 ;;DEFINITION
 /** The reflected IEEE CRC32 every durable byte in this engine is checked with. It
  * is a pure byte function: no file, no device, no state, no allocation. Its body is
- * kept identical to the private static in database/database.c so a file written by
- * either one verifies under the other — which is what makes migrating that copy here
- * a no-op for stored data rather than a format change. */
+ * is the one implementation shared by the WAL, snapshot compatibility code and the
+ * paged format's per-page seals. */
 ;;OVERVIEW
 /** ========================================================================
  * MODULE: Crc32 (util/crc32.c)

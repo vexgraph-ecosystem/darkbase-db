@@ -6,10 +6,8 @@
 
 // util/crc32.h — the engine's one CRC32 (reflected IEEE, polynomial 0xEDB88320).
 //
-// It is deliberately byte-identical to the checksum `database/database.c` currently
-// keeps as a private static, so the two are interchangeable and that copy can move
-// here without changing a single stored byte. The same accumulator also serves the
-// WAL and the paged format's per-page seals.
+// This is the canonical checksum implementation used by the WAL, legacy snapshot
+// compatibility code and the paged format's per-page seals.
 //
 // The accumulator is NOT finalized: `Crc32_update` returns the running value and
 // `Crc32_finalize` complements it. That split is what lets a checksum be computed
