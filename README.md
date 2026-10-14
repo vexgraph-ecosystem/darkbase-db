@@ -13,18 +13,21 @@ Store format (specified, not implemented): [`docs/store-format.md`](docs/store-f
 **What is implemented and proven (macOS arm64):**
 - The class registry (`src/darkbase/type.h`, `PROJ_DARKBASE`) and the workspace
   build entry (`setup_darkbase`); header contract and the `b` graph verified.
-- **M1 in-memory store** — `Database` registers reflection `Struct` entities and
-  binds caller-owned live rows; `DatabaseResult` is a dest-last cursor. Owner
+- **In-memory store** — `Database` registers reflection `Struct` entities and
+  supports borrowed rows plus exact-stride owned copy-in; `DatabaseResult` is a
+  dest-last cursor. Owner
   tests `database_test` and `database_result_test` pass under
   `-Wall -Wextra -Werror`.
-- **M2 persistence slice** — `Database_save`/`Database_load` write and read a
-  `.vexdb` file (64-byte `VEXDB01` header, flat row bytes by `Struct.size`, a
-  trailing CRC32). Round-trip, arena-owned loaded rows, duplicate-load rejection
-  and corrupted-checksum atomicity are covered by `database_test`.
+- **Legacy snapshot compatibility slice** — `Database_save`/`Database_load`
+  still read and write the superseded `.vexdb` M2 dump (64-byte `VEXDB01`
+  header, flat row bytes by `Struct.size`, trailing CRC32). Load validates the
+  complete payload and stages every row copy before publishing any entity.
+  This dump is not the specified persistence direction; pages + WAL are the
+  forward design in `docs/store-format.md` and `wal/`.
 
 **Stubbed, draft, or planned:** field-level predicates and an offset-based codec;
-an mmap/paged store (waits on the Relational Engine `FixedMappedFile` primitive);
-transactions/WAL; CSV/JSON/manifest and generated-header export; reactive
+an mmap/paged store; Database mutation/replay integration with the now-implemented
+standalone WAL; transactions; CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry
 ids are declared ahead of their classes.
 
@@ -100,7 +103,7 @@ Database semantics and persistence remain Darkbase R3.
 
 - `src/darkbase/type.h` — the class registry (`PROJ_DARKBASE`, 1..N).
 - `src/database` — the L2 `Database` interface, entity/row switchboard, dest-last
-  cursor and `.vexdb` persistence (implemented: `database.{h,c}`,
+  cursor and legacy `.vexdb` snapshot compatibility (implemented: `database.{h,c}`,
   `database_result.{h,c}`).
 - `src/schema/` — registration over reflection `Struct`/`Field`/`Class` (future).
 - `src/store/`, `src/codec/`, `src/index/`, `src/tx/`, `src/export/` (future).
@@ -119,8 +122,9 @@ Database semantics and persistence remain Darkbase R3.
 ## Scope and Limitations
 
 **Scope:** darkbase owns the `Database` interface and the native vex store —
-entity/row persistence over R2 reflection, structured (non-SQL) queries, and
-export. It borrows Relational Engine memory/IO and Vexspoke CPU/reflection
+entity/row semantics over R2 reflection, structured (non-SQL) queries, and
+export. Its legacy flat snapshot API is compatibility-only; pages + WAL are the
+specified persistence direction. It borrows Relational Engine memory/IO and Vexspoke CPU/reflection
 contracts; it owns no OS window, GPU, or network behavior.
 
 **Deliberately not covered:**
@@ -131,14 +135,18 @@ contracts; it owns no OS window, GPU, or network behavior.
 - No R1/R4/R5 or `api-haven` headers (the Vertical Integration Law).
 
 **Known limits and gaps:**
-- The `.vexdb` format is native-endian (little-endian hosts) with whole-row
-  copies by `Struct.size`; there is no per-field codec yet.
+- `Database_insert` borrows rows; they and every schema must outlive Database.
+  `Database_insertOwned` copies exactly one `Struct.size` row. Each entity uses
+  only one mode; owned copies and loaded rows are released by `Database_free`.
+- The legacy `.vexdb` snapshot format is native-endian (little-endian hosts)
+  with whole-row bytes by `Struct.size`; there is no per-field codec.
 - Save publishes atomically (temp write + `fsync` + rename), so a failed save
-  never destroys the previous snapshot; load validates header + CRC before
-  mutating. There is no write-ahead log, and a mid-load allocation failure is
-  not fully rolled back.
-- Save/load stream through the engine `File`; no mmap/paged store, page
-  directory, or per-page checksum yet.
+  never destroys the previous snapshot. Load validates the complete payload and
+  stages all rows before publishing any entity.
+- Save/load stream through the engine `File`; the compatibility path has no
+  mmap/paged store or page directory. The specified forward design is pages +
+  WAL, not this flat snapshot. Transactional mutations and durable audit remain
+  unimplemented.
 - Persistence is owner-affine and single-writer; no concurrency or multi-process
   coordination is claimed.
 - Proven only on macOS arm64; Windows is untested.

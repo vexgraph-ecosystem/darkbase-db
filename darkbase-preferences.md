@@ -20,6 +20,7 @@ Universal laws are inherited from the canonical `../../gist/PREFERENCES.md` Inde
 | **Byte-Native Persistence Law** | R3 Database Driver | Mandatory for `darkbase` |
 | **Zero-Alloc Relational Table Scan Law** | R3 Database Driver | Mandatory for `darkbase` |
 | **B-Tree Page Consistency Law** | R3 Database Driver | Mandatory for `darkbase` |
+| **Row Borrow and Owned Copy Law** | R3 Database row ownership | Mandatory for `darkbase` |
 
 ## 2. Exclusive Repo-Local Laws (FULL PROSE RESTATEMENT)
 
@@ -45,6 +46,35 @@ value" thesis carried through to persistence.
 1. **Reflection IS the schema.** Structs are entities, Fields are entity fields, Methods are functions. No parallel ad-hoc schema language, and no darkbase-owned descriptor duplicating `Field`.
 2. **Field owns the physical layout.** Persistence and export read offset, size and typeId from the `Field` (or the `Struct`'s row size), never from a hand-maintained table. Vexspoke's reflection `Field` is the single source of truth; a need for more reads it there first.
 3. **One binding namespace.** Structs, Methods, and plain values resolve through the same scope and naming grammar.
+
+---
+
+### Row Borrow and Owned Copy Law
+
+#### Definition:
+`Database_insert` stores a borrowed row pointer; the caller keeps that row and
+its schema alive for the Database lifetime. `Database_insertOwned` copies one
+exact `Struct.size` byte row into engine-owned memory. A given entity has one
+row ownership mode and never mixes borrowed and owned pointers. Loaded rows use
+the owned mode and are released with the Database.
+
+#### The Why:
+The original pointer-binding contract remains useful for live, caller-owned
+records, while service startup and accepted writes need a row lifetime owned by
+the store. Making the distinction explicit preserves the zero-copy borrowed
+path without confusing a copied row's lifetime or its release owner.
+
+#### The Rule:
+1. Reject a copy-in whose byte length is not exactly the registered schema
+   stride; rejection leaves count and ownership mode unchanged.
+2. Reject mixing modes on one entity. Owned insertion copies bytes and never
+   retains the caller's address.
+3. Free each owned row exactly once with its Database; never free borrowed
+   rows. Schemas remain borrowed and outlive the Database.
+4. Snapshot compatibility loading validates the full input and stages all
+   owned rows before publishing any entity. This all-or-nothing guarantee is
+   limited to that legacy loader; it does not turn the M2 flat dump into the
+   specified persistence design, which is pages plus WAL.
 
 ---
 
