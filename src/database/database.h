@@ -13,11 +13,12 @@
 // database/database.h — the L2 Database: the entity/row switchboard.
 //
 // A Database is the native vex store's in-memory switchboard. It registers
-// reflection Structs as entities (tables) and binds caller-owned live rows to
-// them. A schema IS a Struct (the Entity Model Law): its Fields carry both the
-// read/write behavior and the physical layout, so this class stores nothing but
-// stable row POINTERS — it never copies or owns a row. Persistence, export and
-// reactive programs are later milestones; M1 is the in-memory store.
+// reflection Structs as entities (tables) and binds rows to them. A schema IS a
+// Struct (the Entity Model Law): its Fields carry both the read/write behavior
+// and the physical layout. Database_insert stores a caller-owned borrowed
+// pointer; Database_insertOwned and Database_load store individually
+// Memory_alloc'd row copies owned by Database_free. Ownership is per entity, so
+// one entity never mixes borrowed and owned rows.
 //
 // Vocabulary: a Struct is an entity, a Field is an entity field, a Method is a
 // function. Database adds no schema type of its own.
@@ -29,8 +30,8 @@
 // (Database_errorCode / Database_lastError) and reported once through THROW
 // (the Cold-Strict, Hot-Minimal Validation Law; the THROW Law).
 //
-// Thread affinity: owner-affine (a single writer/reader at a time). Rows are
-// binder-owned and must outlive the Database.
+// Thread affinity: owner-affine (a single writer/reader at a time). Borrowed
+// rows and every schema must outlive the Database; owned row copies do not.
 
 #define DB_ENTITY_NAME_MAX 23u
 #define DB_ENTITY_NAME_BYTES 24u
@@ -77,6 +78,11 @@ Struct *Database_schema(const Database *self, const char *entity);
 
 // Bind a caller-owned live row to an entity. Returns the row index, or -1.
 int32_t Database_insert(Database *self, const char *entity, void *row);
+// Copy one exact schema-stride row into Database ownership. An entity is either
+// entirely borrowed (Database_insert) or owned (loaded / insertOwned); rows do
+// not mix ownership modes. Returns the row index, or -1 without mutation.
+int32_t Database_insertOwned(Database *self, const char *entity, const void *rowBytes,
+                             size_t rowBytesLength);
 // The row pointer at an index, or null (null-safe).
 void *Database_row(const Database *self, const char *entity, uint32_t index);
 // Live rows bound to an entity (0 when absent).
