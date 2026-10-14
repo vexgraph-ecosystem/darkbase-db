@@ -8,7 +8,7 @@
 #endif
 #include "annotation/definition.h"
 #include "annotation/overview.h"
-#include "darkbase/type.h"
+#include "oop/type.h"
 #include "exception/throw.h"
 #include "io/file.h"
 #include "nio/mem.h"
@@ -464,12 +464,29 @@ const char *Wal_codeName(WalCode code) {
     }
 }
 
+static bool writeNull(char *dest, size_t capacity, bool *outTruncated) {
+    const char *text = "nullptr";
+    size_t length = strlen(text);
+    bool cut = length + 1u > capacity;
+    size_t copy = cut ? capacity - 1u : length;
+    if (capacity > 0u) {
+        memcpy(dest, text, copy);
+        dest[copy] = '\0';
+    }
+    if (outTruncated != nullptr)
+        *outTruncated = cut;
+    return !cut;
+}
+
 bool Wal_toString(const Wal *self, char *dest, size_t capacity, bool *outTruncated) {
     if (dest == nullptr || capacity == 0u) {
         if (outTruncated != nullptr)
             *outTruncated = true;
         return false;
     }
+
+    if (self == nullptr)
+        return writeNull(dest, capacity, outTruncated);
     int written = snprintf(dest, capacity, "Wal(open=%d, sequence=%llu, count=%u, base=%llu)",
                            self != nullptr && (*self).open ? 1 : 0,
                            (unsigned long long) Wal_sequence(self), Wal_count(self),
@@ -486,6 +503,9 @@ bool Wal_toStringStruct(const Wal *self, char *dest, size_t capacity, bool *outT
             *outTruncated = true;
         return false;
     }
+
+    if (self == nullptr)
+        return writeNull(dest, capacity, outTruncated);
     int written = snprintf(dest, capacity,
                            "Wal{path=%s, open=%d, baseSequence=%llu, sequence=%llu, count=%u, "
                            "recovered=%u, tailTorn=%d, lastCode=%s}",

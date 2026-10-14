@@ -3,21 +3,23 @@
 
 #include <stdint.h>
 
-#include "oop/type.h"
+#include "type/type.h"
 
-// darkbase-engine/type.h — the darkbase-engine class registry (the One Type Registry Law).
+// oop/type.h — the darkbase-engine class registry (the One Type Registry Law).
 //
 // Every darkbase-engine class is stamped with a 64-bit id built by Type_make from the
 // PROJ_DARKBASE project byte, a form, and the class number below. This is the
 // single source of truth for darkbase-engine's ids; no other header may redefine them.
 //
 // Project byte: PROJ_DARKBASE (0x06) is granted by the shared type algebra
-// (relational-engine type/type.h, re-exported through oop/type.h) and resolved
+// (relational-engine `type/type.h`, INCLUDED DIRECTLY here) and resolved
 // to ARCH_DARKBASE by Type_arch — the same per-project numbering every repo
 // uses. Class numbers start at 1 with gaps allowed.
 //
-// NAMING: this header includes oop/type.h, so the preprocessor namespace is
-// shared with vexspoke's bare ID_* macros (for example vexspoke already owns
+// NAMING: this header includes the engine-owned algebra, NOT another repo's
+// oop/type.h — two repos both owning a path named oop/type.h would make the
+// preprocessor take whichever -I came first. vexspoke owns its own bare ID_*
+// macros (for example vexspoke already owns
 // ID_ENTITY and ID_VARIABLE). Darkbase therefore prefixes every macro with DB_
 // (ID_DB_*, TYPE_DB_*) so no registry symbol can collide with another project.
 // Bare ID_* constants name vexspoke's own class space only; cross-project
@@ -45,9 +47,11 @@
 // 0x0008..0x000A stay free on purpose: the next-in-order ids another slice would
 // take. This one sits clear of them.
 #define ID_DB_WAL                 0x0010u
+#define ID_DB_PAGE                0x0011u
 
 #define TYPE_DB_DATABASE_SINGLETON        (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_DATABASE)
 #define TYPE_DB_WAL_SINGLETON             (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_WAL)
+#define TYPE_DB_PAGE_SINGLETON            (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_PAGE)
 #define TYPE_DB_DATABASE_RESULT_SINGLETON (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_DATABASE_RESULT)
 #define TYPE_DB_DATABASE_ROW_SINGLETON    (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_DATABASE_ROW)
 #define TYPE_DB_DATABASE_ERROR_SINGLETON  (SUGAR_VEX | PROJ_DARKBASE | FORM_STRUCT_SINGLETON | ID_DB_DATABASE_ERROR)

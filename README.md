@@ -11,7 +11,7 @@ Store format (specified, not implemented): [`docs/store-format.md`](docs/store-f
 (future name `darkbase-db`).
 
 **What is implemented and proven (macOS arm64):**
-- The class registry (`src/darkbase/type.h`, `PROJ_DARKBASE`) and the workspace
+- The class registry (`src/oop/type.h`, `PROJ_DARKBASE`) and the workspace
   build entry (`setup_darkbase`); header contract and the `b` graph verified.
 - **In-memory store** — `Database` registers reflection `Struct` entities and
   supports borrowed rows plus exact-stride owned copy-in; `DatabaseResult` is a
@@ -101,7 +101,7 @@ Database semantics and persistence remain Darkbase R3.
 
 ## Layout
 
-- `src/darkbase/type.h` — the class registry (`PROJ_DARKBASE`, 1..N).
+- `src/oop/type.h` — the class registry (`PROJ_DARKBASE`, 1..N).
 - `src/database` — the L2 `Database` interface, entity/row switchboard, dest-last
   cursor and legacy `.vexdb` snapshot compatibility (implemented: `database.{h,c}`,
   `database_result.{h,c}`).
