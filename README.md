@@ -3,37 +3,49 @@
 Build with [b](https://github.com/vex-graph/b):
 `./tools/b build darkbase` from the workspace root.
 
-Store format (specified, not implemented): [`docs/store-format.md`](docs/store-format.md).
+Store format (page-level implementation; relational integration pending): [`docs/store-format.md`](docs/store-format.md).
 
 ## Current State
 
 **Role:** R3 Driver — the `Database` interface owner and its native vex store
 (future name `darkbase-db`).
 
-**What is implemented and proven (macOS arm64):**
+**Implemented surfaces and scoped proof (macOS arm64):**
 - The class registry (`src/oop/type.h`, `PROJ_DARKBASE`) and the workspace
-  build entry (`setup_darkbase`); header contract and the `b` graph verified.
+  build entry (`setup_darkbase`) exist; Store's isolated build compiles the registry.
+  Current global graph execution is blocked as noted below.
 - **In-memory store** — `Database` registers reflection `Struct` entities and
   supports borrowed rows plus exact-stride owned copy-in; `DatabaseResult` is a
   dest-last cursor. Owner
-  tests `database_test` and `database_result_test` pass under
-  `-Wall -Wextra -Werror`.
+  tests `database_test` and `database_result_test` exist. Their graph execution is
+  currently blocked; those retained APIs were not re-proved in this Store cycle.
 - **Legacy snapshot compatibility slice** — `Database_save`/`Database_load`
   still read and write the superseded `.vexdb` M2 dump (64-byte `VEXDB01`
   header, flat row bytes by `Struct.size`, trailing CRC32). Load validates the
   complete payload and stages every row copy before publishing any entity.
   This dump is not the specified persistence direction; pages + WAL are the
   forward design in `docs/store-format.md` and `wal/`.
+- **Page-level durable Store** — `store/store.{h,c}` connects the real Rust
+  reservation mapping, Page seals and an embedded Wal region in one file. It
+  creates/reopens, appends/replaces pages, releases/reuses logical page ids and
+  replays committed full-page redo before admission. The independent owner runner
+  is `python3 tests/darkbase-engine/store/run.py` from the workspace root.
+  Its optimized/assertion-enabled and C ASan/UBSan tests exercise retained live
+  pages, reservation/journal exhaustion, free-list reopen, child exits at actual
+  commit boundaries, torn-data repair, and injected commit-stage IO failures.
+  This is not yet a durable relational `Database` adapter.
 
 **Stubbed, draft, or planned:** field-level predicates and an offset-based codec;
-an mmap/paged store; Database mutation/replay integration with the now-implemented
-standalone WAL; transactions; CSV/JSON/manifest and generated-header export; reactive
+Database mutation/replay integration with the page-level Store; embedded journal
+recycling/checkpoint compaction; catalog and ordered indexes; transactions;
+CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry
 ids are declared ahead of their classes.
 
 **Platforms proven:** macOS arm64 (Apple Silicon) only. Windows is unproven.
 
-**Evidence:** `../../tests/darkbase` owners and `../../gist/test-checklist.md`. This is a
+**Evidence:** `../../../tests/darkbase-engine` owners and workspace
+`metadata/gists/test-checklist.md`. This is a
 lab pass, not a visual or cross-platform claim.
 
 ## What it is
@@ -106,9 +118,11 @@ Database semantics and persistence remain Darkbase R3.
   cursor and legacy `.vexdb` snapshot compatibility (implemented: `database.{h,c}`,
   `database_result.{h,c}`).
 - `src/schema/` — registration over reflection `Struct`/`Field`/`Class` (future).
-- `src/store/`, `src/codec/`, `src/index/`, `src/tx/`, `src/export/` (future).
+- `src/store/` — single-file page-level durable owner; `src/page/`, `src/wal/`,
+  `src/util/` supply page admission, standalone/embedded redo and one CRC32.
+- `src/codec/`, `src/index/`, `src/tx/`, `src/export/` (future).
 - `..` — quarantined external driver dylibs (future: sqlite, postgres, ...).
-- Tests: the shared `../../tests/darkbase` partition (mirrored per unit, the
+- Tests: the shared `../../../tests/darkbase-engine` partition (mirrored per unit, the
   Test Tree Mirror Law); no test file lives inside this repo's source
   directories (the Test Segregation Law).
 
@@ -150,3 +164,20 @@ contracts; it owns no OS window, GPU, or network behavior.
 - Persistence is owner-affine and single-writer; no concurrency or multi-process
   coordination is claimed.
 - Proven only on macOS arm64; Windows is untested.
+- Store is a separate page API, not wired into Database or Headless. One redo
+  record is one page, not an entity transaction. All redo is retained: the
+  caller-selected embedded journal eventually fills and rejects new mutations
+  observably. `Store_sync` makes data durable but does not retire journal history.
+  Durable journal recycling/checkpoint compaction remains required future work.
+- Store requires trusted stable paths, exclusive external serialization and no
+  external mutation/truncation; it supplies no OS lock or hostile-writer sandbox.
+  Failed post-log operations require reopen and may have committed. No writable
+  mapping aliases escape. Initial creation can leave a refused artifact and does
+  not sync its parent directory. Child-exit/torn-page proof is not power-cut proof.
+- Store's isolated runner builds fresh native dependencies with C sanitizers;
+  Rust sanitizer instrumentation, allocator-failure coverage, real OS sync-error
+  injection and other platforms remain gaps. The installed Rust standard library
+  emits a macOS 27-versus-14 deployment warning; macOS 14 runtime closure is unproved.
+- The workspace graph currently stops before Store execution at the global
+  Vexspoke ownership ratchet after the workspace path migration. Independent
+  Store proof does not imply that graph registration/migration is repaired.
