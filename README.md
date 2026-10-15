@@ -24,7 +24,11 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
 - **Structured equality query** — `Database_queryEqual` resolves one reflected
   Field and returns exact-byte matches through a cursor. Its owner tests cover
   zero/one/many matches and invalid schema/value spans. It is an in-memory linear
-  scan, not a persistent index, range query, numeric comparison or projection.
+  scan, not a persistent index, numeric comparison or projection.
+- **Signed range query** — `Database_queryInt32Range` scans a validated four-byte
+  field as native signed `int32_t`, with inclusive bounds. It is a linear scan;
+  callers must ensure the field bytes have that representation. No type
+  coercion or index lookup is provided.
 - **Persisted catalog inspection** — `Database_storeCatalogEntry` returns a
   copied name/stride/row-count record by catalog position. The committed page
   chain and checksum are validated before returning it; the result survives Store
@@ -49,7 +53,7 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
   transactions, and it bypasses the legacy M2 snapshot parser.
 
 **Stubbed, draft, or planned:** field projection, additional predicates and an
-offset-based codec; persistent indexes/range queries; embedded journal
+offset-based codec; persistent indexes; embedded journal
 recycling/checkpoint compaction; transactions;
 CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry

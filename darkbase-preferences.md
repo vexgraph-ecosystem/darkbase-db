@@ -208,8 +208,14 @@ reflected Field cold, validates its nonzero span against the entity row stride,
 and compares exact bytes across the in-memory rows. It returns a cursor owning
 only its temporary row-pointer list; matching row values remain borrowed and the
 cursor must be freed before Database. It is not numeric comparison, projection,
-ordering, range querying, persistent catalog lookup, or an index. Database and
+ordering, persistent catalog lookup, or an index. Database and
 query results remain caller-serialized/owner-affine.
+
+`Database_queryInt32Range` interprets one exact-width field span as native
+`int32_t` and returns rows within inclusive signed bounds. It performs no type
+coercion and maintains no index; callers must use it only where the field's row
+bytes carry that representation. Reversed bounds and invalid spans reject
+loudly without changing Database state.
 
 `Database_storeCatalogEntry` returns one copied persisted entity descriptor by
 catalog index after validating the root, page chain, checksum and record spans.
