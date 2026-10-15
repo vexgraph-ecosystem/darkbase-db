@@ -155,12 +155,13 @@ work rather than silently calling standalone Wal's destructive truncation API.
 
 ## Database page-chain bridge (initial whole-image slice)
 
-`Database_saveStore` and `Database_loadStore` connect the existing reflected
-entity/owned-row API to the page-level Store. Page id 1 is a `PAGE_KIND_CATALOG`
-root record. It points to linked `PAGE_KIND_LEAF` chunks containing the existing
-M2 byte payload (entity names, row strides/counts and raw row bytes). Callers
-register the same reflection `Struct`s before loading; the normal staged loader
-validates schemas and publishes owned rows only after the complete image passes.
+`Database_saveStore` and `Database_loadStore` connect the reflected entity and
+owned-row API to the page-level Store using a dedicated Store catalog encoding,
+not the legacy M2 snapshot parser. Page id 1 is a `PAGE_KIND_CATALOG` root record.
+It points to linked catalog pages whose records carry reflected entity names,
+row strides and counts, followed by each entity's raw row spans. Callers register
+the same reflection `Struct`s before loading; the Store loader validates the
+complete catalog and schemas, then stages owned rows before publishing them.
 
 Save writes and syncs every new chunk through Store before replacing the root in
 one page commit. A rejected write before root publication leaves the prior root

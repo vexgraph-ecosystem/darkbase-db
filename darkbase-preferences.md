@@ -193,11 +193,12 @@ refuse/count when its explicit capacity or the data reservation is exhausted.
 `Store_sync` never truncates or retires this embedded history.
 
 `Database_saveStore`/`Database_loadStore` provide the initial Database bridge:
-the complete existing reflected-row snapshot is split into leaf-page chunks and
-published through one catalog root-page replacement. Loading requires the same
-schemas registered first and uses the existing staged owned-row admission. This
-is whole-image persistence, not incremental row addressing or a multi-page
-transaction. Old snapshot pages and redo records are retained; capacity refusal
+a dedicated reflected catalog encoding and raw owned-row spans are split into
+page chains and published through one catalog root-page replacement; they do not
+route through the legacy M2 snapshot parser. Loading requires the same schemas
+registered first and stages all owned rows before publication. This is
+whole-image persistence, not incremental row addressing or a multi-page
+transaction. Old catalog/data pages and redo records are retained; capacity refusal
 before root publication preserves the previously selected image, while uncertain
 root commit requires close/reopen. This bridge does not provide checkpointing,
 schema migration, structured indexes, or make Store operations thread-safe.
