@@ -213,9 +213,22 @@ query results remain caller-serialized/owner-affine.
 
 `Database_queryInt32Range` interprets one exact-width field span as native
 `int32_t` and returns rows within inclusive signed bounds. It performs no type
-coercion and maintains no index; callers must use it only where the field's row
-bytes carry that representation. Reversed bounds and invalid spans reject
-loudly without changing Database state.
+coercion; callers must use it only where the field's row bytes carry that
+representation. Reversed bounds and invalid spans reject loudly without changing
+Database state. It uses the entity's declared int32 index when one covers the
+field and scans the row list otherwise, returning the same matches either way.
+
+`Database_indexBuild` declares and builds the in-memory int32 index for one
+field, and admits only a Field carrying `REFLECT_FIELD_INDEXED` whose span is
+exactly `int32_t` — the schema's flag stays the single declaration point. The
+records are a key-sorted array of borrowed row pointers. Rows are append-only,
+so an insert only marks the records stale and the next query rebuilds them,
+which keeps admission allocation-free and free of partial state. While an index
+exists, the indexed field of a bound row must not be mutated in place; the
+Database does not detect that. Nothing is persisted, and a load drops the
+records while the definition survives for the next query to rebuild. This is not
+a persisted page-level index, an ordered scan of other field types, or a
+multi-field index.
 
 `Database_storeCatalogEntry` returns one copied persisted entity descriptor by
 catalog index after validating the root, page chain, checksum and record spans.
