@@ -28,11 +28,15 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
 - **Signed range query** — `Database_queryInt32Range` scans a validated four-byte
   field as native signed `int32_t`, with inclusive bounds. Callers must ensure
   the field bytes have that representation; no type coercion is performed.
-- **In-memory int32 index** — `Database_indexBuild` indexes one field whose
+- **Persisted int32 index** — `Database_indexBuild` indexes one field whose
   reflected `Field` carries `REFLECT_FIELD_INDEXED`; the range query uses it when
   present and scans otherwise, returning the same matches. Records are a
-  key-sorted array of borrowed row pointers, rebuilt after a row-list change and
-  never persisted. This is not a persisted page-level index.
+  key-sorted array of borrowed row pointers, rebuilt after a row-list change.
+  `Database_saveStore` writes each declared index after its entity's row span in
+  the same catalog payload, so rows and index publish under one root commit;
+  `Database_loadStore` re-validates ordering, `rowIndex` range and every key
+  against its row before publishing. Still a whole-image rewrite: no page-level
+  incremental index.
 - **Persisted catalog inspection** — `Database_storeCatalogEntry` returns a
   copied name/stride/row-count record by catalog position. The committed page
   chain and checksum are validated before returning it; the result survives Store
@@ -57,7 +61,7 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
   transactions, and it bypasses the legacy M2 snapshot parser.
 
 **Stubbed, draft, or planned:** field projection, additional predicates and an
-offset-based codec; persisted page-level indexes; embedded journal
+offset-based codec; page-level (incremental) indexes; embedded journal
 recycling/checkpoint compaction; transactions;
 CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry

@@ -225,10 +225,19 @@ records are a key-sorted array of borrowed row pointers. Rows are append-only,
 so an insert only marks the records stale and the next query rebuilds them,
 which keeps admission allocation-free and free of partial state. While an index
 exists, the indexed field of a bound row must not be mutated in place; the
-Database does not detect that. Nothing is persisted, and a load drops the
-records while the definition survives for the next query to rebuild. This is not
-a persisted page-level index, an ordered scan of other field types, or a
-multi-field index.
+Database does not detect that.
+
+`Database_saveStore` persists each declared index as `{int32_t key; uint32_t
+rowIndex}` records placed after the entity's row span, inside the same catalog
+payload and therefore under the same single root-page publication: rows and index
+cannot tear apart. `Database_loadStore` re-validates every record before
+publishing anything — key ordering, `rowIndex` range, and each key against the
+bytes of the row it names — and refuses the whole image when the registered
+schema no longer declares that exact indexed span. Addresses are never persisted;
+the records are re-pointed at the loaded rows. An entity whose image carries no
+index keeps its local declaration and rebuilds on the next query. This is still a
+whole-image rewrite, not incremental index pages: no page-level index, no ordered
+scan of other field types, and no multi-field index.
 
 `Database_storeCatalogEntry` returns one copied persisted entity descriptor by
 catalog index after validating the root, page chain, checksum and record spans.

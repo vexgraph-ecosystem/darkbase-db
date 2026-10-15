@@ -170,6 +170,18 @@ count and remains usable after Store close. An out-of-range index returns
 `DATABASE_ABSENT` loudly. This is metadata inspection, not schema reconstruction:
 the caller still supplies matching reflected `Struct`s before loading rows.
 
+Each entity's descriptor is followed by its raw row span and then, when the
+entity declares an index, by one `{int32_t key; uint32_t rowIndex}` record per
+row. Both live in the same catalog payload, so the single root-page publication
+publishes rows and index together and they cannot tear apart. The loader
+re-validates each record before publishing anything — key ordering, `rowIndex`
+range, and every key against the bytes of the row it names — and refuses the whole
+image if the registered schema no longer declares that exact indexed span. No
+address is ever persisted; the loaded records are re-pointed at the loaded rows.
+This is a whole-image bridge, so the index is rewritten on every save; it is not
+a page-level incremental index. Catalog version 2 carries this section; version 1
+images are refused rather than reinterpreted.
+
 Save writes and syncs every new chunk through Store before replacing the root in
 one page commit. A rejected write before root publication leaves the prior root
 selected after close/reopen, although already committed unreferenced chunks can
