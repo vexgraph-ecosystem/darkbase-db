@@ -114,7 +114,7 @@
  * Public Constructors: (.h) Database_0(), _1(chunkBytes), _init, _free
  * Public Core Functions: (.h) _kind, _check, _define, _entityIndex, _entityCount,
  *                             _schema, _insert, _insertOwned, _row, _count, _select,
- *                             _queryEqual
+ *                             _queryEqual, _queryInt32Range
  * Public Persistence: (.h) _save, _load
  *                      _saveStore, _loadStore (caller-owned page Store)
  *   int32_t Database_saveStore(Database *self, Store *store)
@@ -123,6 +123,8 @@
  * Public Structured Query:
  *   DatabaseResult *Database_queryEqual(Database *self, const char *entity,
  *       const char *field, const void *value, size_t valueLength)
+ *   DatabaseResult *Database_queryInt32Range(Database *self, const char *entity,
+ *       const char *field, int32_t minimum, int32_t maximum)
  * Store catalog discovery returns a copied DatabaseCatalogEntry value; its
  * name/stride/count remain valid after Store close. A requested out-of-range
  * position returns DATABASE_ABSENT and a cold diagnostic.
@@ -140,6 +142,9 @@
  * queryEqual validates one reflected Field span and scans rows for exact byte
  * equality. It allocates an owned pointer-list container, borrows matched rows,
  * and returns no numeric coercion, ordering, planner or persistent index.
+ * queryInt32Range admits an exact int32_t byte span and interprets those bytes
+ * as native int32_t values with inclusive signed comparisons. This operation
+ * is not an index.
  * ============================================================================
  */
 
@@ -616,6 +621,107 @@ DatabaseResult *Database_queryEqual(Database *self, const char *entityName,
         ChunkedList_free(selected);
         recordError(self, DATABASE_EXHAUSTED, "queryEqual: cursor allocation failed");
         THROW("Database_queryEqual: cursor allocation failed");
+        return nullptr;
+    }
+    recordError(self, DATABASE_OK, "");
+    return result;
+}
+
+/** Inclusive signed range scan for one exactly typed reflected int32 field. */
+DatabaseResult *Database_queryInt32Range(Database *self, const char *entityName,
+                                         const char *fieldName, int32_t minimum,
+                                         int32_t maximum) {
+    if (self == nullptr || entityName == nullptr || fieldName == nullptr ||
+        minimum > maximum) {
+        recordError(self, DATABASE_INVALID, "queryInt32Range: invalid argument or range");
+        THROW("Database_queryInt32Range: invalid argument or range");
+        return nullptr;
+    }
+    int32_t entityIndex = Database_entityIndex(self, entityName);
+    if (entityIndex < 0) {
+        recordError(self, DATABASE_ABSENT, "queryInt32Range: no such entity");
+        THROW("Database_queryInt32Range: no such entity");
+        return nullptr;
+    }
+    DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities,
+                                                     (uint32_t) entityIndex);
+    if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr) {
+        recordError(self, DATABASE_ABSENT, "queryInt32Range: entity unavailable");
+        THROW("Database_queryInt32Range: entity unavailable");
+        return nullptr;
+    }
+    char foldedField[REFLECT_FIELD_NAME_BYTES];
+    if (!VariableSlot_foldName(fieldName, foldedField)) {
+        recordError(self, DATABASE_INVALID, "queryInt32Range: invalid field name");
+        THROW("Database_queryInt32Range: invalid field name");
+        return nullptr;
+    }
+    Field *matched = nullptr;
+    uint32_t fieldCount = Struct_count((*entity).schema);
+    for (uint32_t i = 0u; i < fieldCount; i++) {
+        Field *candidate = Struct_get((*entity).schema, i);
+        const char *candidateName = Field_getName(candidate);
+        char candidateFolded[REFLECT_FIELD_NAME_BYTES];
+        if (candidateName != nullptr &&
+            VariableSlot_foldName(candidateName, candidateFolded) &&
+            strcmp(candidateFolded, foldedField) == 0) {
+            if (matched != nullptr) {
+                recordError(self, DATABASE_INVALID, "queryInt32Range: ambiguous field name");
+                THROW("Database_queryInt32Range: ambiguous field name");
+                return nullptr;
+            }
+            matched = candidate;
+        }
+    }
+    if (matched == nullptr) {
+        recordError(self, DATABASE_ABSENT, "queryInt32Range: no such field");
+        THROW("Database_queryInt32Range: no such field");
+        return nullptr;
+    }
+    uint32_t rowSize = Struct_getSize((*entity).schema);
+    uint32_t offset = Field_getOffset(matched);
+    uint32_t fieldSize = Field_getSize(matched);
+    if (fieldSize != sizeof(int32_t) || offset > rowSize ||
+        fieldSize > rowSize - offset) {
+        recordError(self, DATABASE_INVALID, "queryInt32Range: field is not a valid int32 span");
+        THROW("Database_queryInt32Range: field is not a valid int32 span");
+        return nullptr;
+    }
+    ChunkedList *selected = ChunkedList_3(ID_DB_DATABASE_ROW,
+        (uint32_t) sizeof(void*), (*self).chunkBytes);
+    if (selected == nullptr) {
+        recordError(self, DATABASE_EXHAUSTED, "queryInt32Range: result allocation failed");
+        THROW("Database_queryInt32Range: result allocation failed");
+        return nullptr;
+    }
+    uint32_t rowCount = ChunkedList_size((*entity).rows);
+    for (uint32_t i = 0u; i < rowCount; i++) {
+        uint8_t *rowSlot = ChunkedList_slot((*entity).rows, i);
+        void *row = rowSlot == nullptr ? nullptr : *((void**) rowSlot);
+        if (row == nullptr) {
+            ChunkedList_free(selected);
+            recordError(self, DATABASE_CORRUPT, "queryInt32Range: null row slot");
+            THROW("Database_queryInt32Range: null row slot");
+            return nullptr;
+        }
+        int32_t value = 0;
+        memcpy(&value, (const uint8_t*) row + offset, sizeof(value));
+        if (value >= minimum && value <= maximum) {
+            uint8_t *selectedSlot = ChunkedList_addSlot(selected);
+            if (selectedSlot == nullptr) {
+                ChunkedList_free(selected);
+                recordError(self, DATABASE_EXHAUSTED, "queryInt32Range: result growth failed");
+                THROW("Database_queryInt32Range: result growth failed");
+                return nullptr;
+            }
+            *((void**) selectedSlot) = row;
+        }
+    }
+    DatabaseResult *result = DatabaseResult_2(selected, true);
+    if (result == nullptr) {
+        ChunkedList_free(selected);
+        recordError(self, DATABASE_EXHAUSTED, "queryInt32Range: cursor allocation failed");
+        THROW("Database_queryInt32Range: cursor allocation failed");
         return nullptr;
     }
     recordError(self, DATABASE_OK, "");

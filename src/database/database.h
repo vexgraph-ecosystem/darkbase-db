@@ -100,6 +100,13 @@ DatabaseResult *Database_select(Database *self, const char *entity);
 DatabaseResult *Database_queryEqual(Database *self, const char *entity,
                                     const char *field, const void *value,
                                     size_t valueLength);
+// Inclusive signed int32 range query: the field bytes are interpreted as a
+// native int32_t regardless of reflected typeId. The field must have exactly
+// sizeof(int32_t) bytes within Struct.size. Result borrows matching rows; this
+// is a cold scan, not an index lookup.
+DatabaseResult *Database_queryInt32Range(Database *self, const char *entity,
+                                         const char *field, int32_t minimum,
+                                         int32_t maximum);
 
 // --- Persistence (M2, .vexdb) ---
 // Serialize the registry and bound rows to a native-endian .vexdb file, or load
