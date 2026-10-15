@@ -21,6 +21,7 @@ Universal laws are inherited from the canonical `../../gist/PREFERENCES.md` Inde
 | **Zero-Alloc Relational Table Scan Law** | R3 Database Driver | Mandatory for `darkbase` |
 | **B-Tree Page Consistency Law** | R3 Database Driver | Mandatory for `darkbase` |
 | **Row Borrow and Owned Copy Law** | R3 Database row ownership | Mandatory for `darkbase` |
+| **Durable Page Store Boundary Law** | Single-file page-level Store | Embedded redo ordering, reopen, refusal and reuse owner proof |
 
 ## 2. Exclusive Repo-Local Laws (FULL PROSE RESTATEMENT)
 
@@ -172,6 +173,41 @@ Predictable index geometry guarantees bounded traversal depth and prevents fragm
 ---
 
 ## 3. Repo-Local Extensions (managed, per the Conflict Triage Law)
+
+### Durable Page Store Boundary Law
+
+`store/store.{h,c}` owns a page-level durable owner over R2's real Rust growable
+mapping, Page and Wal. One physical file holds an immutable bootstrap page, a
+caller-sized embedded redo region and data pages. No sidecar or C mapping clone
+is introduced. Full detached sealed page images enter redo; its commit marker
+is synced before mapped data changes. Data sync precedes success. Reopen admits
+only after replay and free-chain validation; no checkpoint baseline other than
+zero is supported. Uncertain IO blocks further admission until close/reopen,
+and a failed call may be recovered as committed.
+
+This is a separate primitive, not a durable `Database`/Headless integration,
+schema/catalog or ordered row index. Release/reuse operates on logical page ids;
+there is no stale row-handle generation promise. Embedded history is retained:
+safe journal recycling/checkpoint compaction remains unimplemented, and writes
+refuse/count when its explicit capacity or the data reservation is exhausted.
+`Store_sync` never truncates or retires this embedded history.
+
+The caller owns one serialization/exclusion domain, stable trusted paths and
+all external alias/truncation exclusion. No OS lock or hostile-writer sandbox
+is inferred. Geometry, owned pointers, page count, free head, sequence and
+failure state mutate only through construction, admission and durable operations;
+validated getters, not lifetime-forging setters, expose them. This is a scoped
+managed accessor exception under the Conflict Triage Law and Single Class Per
+File Law (Java Law). A non-reentrant observation callback may observe commit
+boundaries but production correctness never depends on it. Initial creation is
+not a crash-atomic publication and may retain a rejected artifact for recovery.
+
+Registered independent proof is `tests/darkbase-engine/store/run.py` (workspace
+root command), including mirrored Store/Page/Wal owners with fresh native C
+dependencies, real Rust archive, optimized assertions and C ASan/UBSan. Actual
+power loss, Rust sanitizer instrumentation, allocator failure, full OS-error and
+other-platform/runtime-floor proof remain explicit gaps. The global graph's
+post-migration ownership-ratchet failure is separate and not silently bypassed.
 
 ;;INTENTION("R3 Database Driver: native vex entity store over the shared reflection vocabulary (Struct=entity, Field=entity field with physical layout, Method=function) with reactive store-event programs; zero-alloc table scans; strict page consistency; structured native query, not a SQL engine.")
 
