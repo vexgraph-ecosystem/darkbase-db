@@ -102,6 +102,9 @@
  *   DbLoadStage {
  *     DbEntity *entity;       // target untouched entity during staged loading
  *     ChunkedList *rows;      // temporary complete owned-row list
+ *     ChunkedList *indexRecords; // persisted records re-pointed at the staged rows
+ *     char indexField[24];    // persisted index definition
+ *     uint32_t indexOffset;
  *   }
  *   DatabaseStoreRoot {
  *     char magic[8]; uint32_t version, firstPage; uint64_t length;
@@ -112,9 +115,13 @@
  *     // linked data chunk; offsets must be contiguous while loading
  *   }
  *   DatabaseStoreCatalog { char magic[8]; uint32_t version, entityCount }
- *     catalog byte-stream header.
- *   DatabaseStoreEntity { char name[24]; uint32_t stride, rowCount }
- *     one reflected entity descriptor followed by its raw row bytes.
+ *     catalog byte-stream header (version 2 adds the persisted index section).
+ *   DatabaseStoreEntity { char name[24]; uint32_t stride, rowCount;
+ *                         char indexField[24]; uint32_t indexOffset, indexCount }
+ *     one reflected entity descriptor followed by its raw row bytes and then its
+ *     indexCount DatabaseStoreIndexRecord entries.
+ *   DatabaseStoreIndexRecord { int32_t key; uint32_t rowIndex }
+ *     one persisted index record: the key and the row position carrying it.
  *
  * PRIVATE HELPERS (persistence, pure logic):
  *   writeAll(file, src, length)             // short-write-safe (static)
@@ -123,7 +130,7 @@
  *   loadPayload(self, bytes, len, count)         // validate snapshot records (static)
  *   loadCommit(self, bytes, len, count)          // stage rows then publish atomically (static)
  *   freeOwnedRows(rows)                          // free staged owned copies (static)
- *   databaseStoreCatalogBytes(self, outLength)   // serialize catalog + rows (static)
+ *   databaseStoreCatalogBytes(self, outLength)   // serialize catalog + rows + index (static)
  *   databaseStoreReadRoot(store, pageBytes, outRoot) // validate root page (static)
  *   databaseStoreEnsureRoot(store)               // seed/validate page id 1 (static)
  *   databaseStoreLoadCommit(self, bytes, length)  // stage and publish rows atomically (static)
@@ -188,9 +195,9 @@ typedef struct DbEntity {
 
 // PRIVATE HELPER RECORD (owned by Database; behaviorless)
 typedef struct DbIndexRecord {
-    int32_t key;   // indexed int32 value admitted from the row bytes
-    uint32_t pad;  // explicit padding
-    void *row;     // borrowed bound row carrying that value
+    int32_t key;       // indexed int32 value admitted from the row bytes
+    uint32_t rowIndex; // position of that row inside the entity's row list
+    void *row;         // borrowed bound row carrying that value
 } DbIndexRecord;
 
 // PRIVATE HELPER RECORD (owned by Database; behaviorless) — the resolved span
@@ -204,8 +211,11 @@ typedef struct DbFieldSpan {
 
 // PRIVATE HELPER RECORD
 typedef struct DbLoadStage {
-    DbEntity *entity;       // target entity, unchanged until every row is ready
-    ChunkedList *rows;      // complete temporary owned row list
+    DbEntity *entity;          // target entity, unchanged until every row is ready
+    ChunkedList *rows;         // complete temporary owned row list
+    ChunkedList *indexRecords; // persisted records, re-pointed at the staged rows
+    char indexField[DB_ENTITY_NAME_BYTES]; // persisted index definition
+    uint32_t indexOffset;
 } DbLoadStage;
 
 // PRIVATE HELPERS
@@ -326,6 +336,7 @@ static bool indexRebuild(Database *self, DbEntity *entity) {
         int32_t key = 0;
         memcpy(&key, (const uint8_t*) row + (*entity).indexOffset, sizeof(key));
         (*record).key = key;
+        (*record).rowIndex = i;
         (*record).row = row;
     }
     indexSort(records);
@@ -1127,12 +1138,24 @@ typedef struct DatabaseStoreEntity {
     char name[DB_ENTITY_NAME_BYTES];
     uint32_t stride;
     uint32_t rowCount;
+    char indexField[DB_ENTITY_NAME_BYTES]; // folded indexed field name ("" = none)
+    uint32_t indexOffset;                  // in-row byte offset of the indexed span
+    uint32_t indexCount;                   // persisted index records after the rows
 } DatabaseStoreEntity;
-_Static_assert(sizeof(DatabaseStoreEntity) == 32u,
-               "DatabaseStoreEntity must stay 32 Bytes");
+_Static_assert(sizeof(DatabaseStoreEntity) == 64u,
+               "DatabaseStoreEntity must stay 64 Bytes");
+
+// One persisted index record: the key and the position of the row carrying it.
+// The rowIndex, not an address, is what makes the records reload-addressable.
+typedef struct DatabaseStoreIndexRecord {
+    int32_t key;
+    uint32_t rowIndex;
+} DatabaseStoreIndexRecord;
+_Static_assert(sizeof(DatabaseStoreIndexRecord) == 8u,
+               "DatabaseStoreIndexRecord must stay 8 Bytes");
 
 #define DATABASE_STORE_ROOT_ID 1u
-#define DATABASE_STORE_VERSION 1u
+#define DATABASE_STORE_VERSION 2u
 #define DATABASE_STORE_ROOT_MAGIC "DBROOT01"
 #define DATABASE_STORE_CATALOG_MAGIC "DBCAT001"
 
@@ -1318,11 +1341,26 @@ static int32_t loadCommit(Database *self, const uint8_t *payload, size_t length,
             (*entity).owned = 1u;
             stages[i].rows = nullptr;
             ChunkedList_free(oldRows);
-            indexInvalidate(entity); // the row list changed; the next query rebuilds
+            if (stages[i].indexRecords != nullptr) {
+                // The image carried an index: adopt its definition and records,
+                // which already point at the rows just published.
+                indexDrop(entity);
+                memcpy((*entity).indexField, stages[i].indexField,
+                       sizeof((*entity).indexField));
+                (*entity).indexOffset = stages[i].indexOffset;
+                (*entity).indexDirty = 0u;
+                (*entity).indexRecords = stages[i].indexRecords;
+                stages[i].indexRecords = nullptr;
+            } else {
+                indexInvalidate(entity); // changed rows; the next query rebuilds
+            }
         }
     }
-    for (uint32_t i = 0u; i < staged; i++)
+    for (uint32_t i = 0u; i < staged; i++) {
         freeOwnedRows(stages[i].rows);
+        if (stages[i].indexRecords != nullptr)
+            ChunkedList_free(stages[i].indexRecords);
+    }
     Memory_free(stages);
     return status;
 }
@@ -1513,9 +1551,23 @@ static uint8_t *databaseStoreCatalogBytes(Database *self, size_t *outLength) {
         if (stride == 0u || (size_t) count > (SIZE_MAX - sizeof(DatabaseStoreEntity)) / stride)
             return nullptr;
         size_t rowBytes = (size_t) count * stride;
-        if (length > SIZE_MAX - sizeof(DatabaseStoreEntity) - rowBytes)
+        if ((*entity).indexField[0] != '\0') {
+            // A declared index is refreshed here so the image never carries stale
+            // keys; a refresh failure fails the save instead of dropping quietly.
+            if (((*entity).indexRecords == nullptr || (*entity).indexDirty != 0u) &&
+                !indexRebuild(self, entity))
+                return nullptr;
+            if (ChunkedList_size((*entity).indexRecords) != count)
+                return nullptr; // an index must cover every row
+        }
+        size_t indexBytes = (*entity).indexField[0] == '\0' ? 0u
+            : (size_t) count * sizeof(DatabaseStoreIndexRecord);
+        if (rowBytes > SIZE_MAX - indexBytes - sizeof(DatabaseStoreEntity))
             return nullptr;
-        length += sizeof(DatabaseStoreEntity) + rowBytes;
+        size_t region = sizeof(DatabaseStoreEntity) + rowBytes + indexBytes;
+        if (length > SIZE_MAX - region)
+            return nullptr;
+        length += region;
     }
     uint8_t *bytes = (uint8_t*) Memory_alloc(0u, length);
     if (bytes == nullptr)
@@ -1531,11 +1583,27 @@ static uint8_t *databaseStoreCatalogBytes(Database *self, size_t *outLength) {
         DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, e);
         uint32_t stride = Struct_getSize((*entity).schema);
         uint32_t count = ChunkedList_size((*entity).rows);
+        uint32_t indexCount = 0u;
+        if ((*entity).indexField[0] != '\0') {
+            if (((*entity).indexRecords == nullptr || (*entity).indexDirty != 0u) &&
+                !indexRebuild(self, entity)) {
+                Memory_free(bytes);
+                return nullptr;
+            }
+            indexCount = ChunkedList_size((*entity).indexRecords);
+            if (indexCount != count) {
+                Memory_free(bytes);
+                return nullptr;
+            }
+        }
         DatabaseStoreEntity record;
         memset(&record, 0, sizeof(record));
         memcpy(record.name, (*entity).name, sizeof(record.name));
         record.stride = stride;
         record.rowCount = count;
+        memcpy(record.indexField, (*entity).indexField, sizeof(record.indexField));
+        record.indexOffset = indexCount == 0u ? 0u : (*entity).indexOffset;
+        record.indexCount = indexCount;
         memcpy(bytes + offset, &record, sizeof(record));
         offset += sizeof(record);
         for (uint32_t r = 0u; r < count; r++) {
@@ -1547,6 +1615,14 @@ static uint8_t *databaseStoreCatalogBytes(Database *self, size_t *outLength) {
             }
             memcpy(bytes + offset, row, stride);
             offset += stride;
+        }
+        for (uint32_t r = 0u; r < indexCount; r++) {
+            DbIndexRecord *source = indexAt((*entity).indexRecords, r);
+            DatabaseStoreIndexRecord entry;
+            entry.key = (*source).key;
+            entry.rowIndex = (*source).rowIndex;
+            memcpy(bytes + offset, &entry, sizeof(entry));
+            offset += sizeof(entry);
         }
     }
     if (outLength != nullptr)
@@ -1626,6 +1702,40 @@ static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
             return DATABASE_ABSENT;
         if (Struct_getSize((*entity).schema) != record.stride)
             return DATABASE_INVALID;
+        if (record.indexCount != 0u) {
+            if (record.indexField[0] == '\0' || record.indexCount != record.rowCount)
+                return DATABASE_CORRUPT;
+            if (record.indexOffset > record.stride ||
+                sizeof(int32_t) > record.stride - record.indexOffset)
+                return DATABASE_CORRUPT;
+            // The registered schema must still declare that exact indexed span:
+            // a schema that drifted from the image is rejected, never adapted.
+            DbFieldSpan span = resolveField(entity, record.indexField);
+            if (span.code != DATABASE_OK || span.offset != record.indexOffset ||
+                span.size != sizeof(int32_t) || !Field_isIndexed(span.field))
+                return DATABASE_CORRUPT;
+        }
+        size_t indexBytes = (size_t) record.indexCount *
+            sizeof(DatabaseStoreIndexRecord);
+        if (indexBytes > length - offset - rowBytes)
+            return DATABASE_CORRUPT;
+        if (record.indexCount != 0u) {
+            const uint8_t *rows = bytes + offset;
+            const uint8_t *entries = rows + rowBytes;
+            int32_t lastKey = 0;
+            for (uint32_t r = 0u; r < record.indexCount; r++) {
+                DatabaseStoreIndexRecord entry;
+                memcpy(&entry, entries + (size_t) r * sizeof(entry), sizeof(entry));
+                if (entry.rowIndex >= record.rowCount)
+                    return DATABASE_CORRUPT;
+                int32_t key = 0;
+                memcpy(&key, rows + (size_t) entry.rowIndex * record.stride +
+                    record.indexOffset, sizeof(key));
+                if (key != entry.key || (r != 0u && entry.key < lastKey))
+                    return DATABASE_CORRUPT; // keys must be sorted and match their rows
+                lastKey = entry.key;
+            }
+        }
         if (ChunkedList_size((*entity).rows) != 0u)
             return DATABASE_DUPLICATE;
         size_t priorOffset = sizeof(catalog);
@@ -1634,9 +1744,11 @@ static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
             memcpy(&previous, bytes + priorOffset, sizeof(previous));
             if (strcmp(previous.name, record.name) == 0)
                 return DATABASE_DUPLICATE;
-            priorOffset += sizeof(previous) + (size_t) previous.rowCount * previous.stride;
+            priorOffset += sizeof(previous) +
+                (size_t) previous.rowCount * previous.stride +
+                (size_t) previous.indexCount * sizeof(DatabaseStoreIndexRecord);
         }
-        offset += rowBytes;
+        offset += rowBytes + indexBytes;
     }
     if (offset != length)
         return DATABASE_CORRUPT;
@@ -1691,7 +1803,40 @@ static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
             }
             *((void**) slot) = copy;
         }
-        offset += (size_t) record.rowCount * record.stride;
+        if (status == DATABASE_OK && record.indexCount != 0u) {
+            ChunkedList *records = ChunkedList_3(ID_DB_DATABASE_ROW,
+                (uint32_t) sizeof(DbIndexRecord), (*self).chunkBytes);
+            if (records == nullptr || !ChunkedList_reserve(records, record.indexCount)) {
+                ChunkedList_free(records);
+                status = DATABASE_EXHAUSTED;
+                break;
+            }
+            for (uint32_t r = 0u; r < record.indexCount; r++) {
+                DatabaseStoreIndexRecord entry;
+                memcpy(&entry, bytes + offset +
+                    (size_t) record.rowCount * record.stride +
+                    (size_t) r * sizeof(entry), sizeof(entry));
+                uint8_t *rowSlot = ChunkedList_slot(rows, entry.rowIndex);
+                uint8_t *slot = rowSlot == nullptr ? nullptr : ChunkedList_addSlot(records);
+                if (slot == nullptr) {
+                    ChunkedList_free(records);
+                    status = DATABASE_EXHAUSTED;
+                    break;
+                }
+                DbIndexRecord *target = (DbIndexRecord*) slot;
+                (*target).key = entry.key;
+                (*target).rowIndex = entry.rowIndex;
+                (*target).row = *((void**) rowSlot);
+            }
+            if (status != DATABASE_OK)
+                break;
+            stages[staged - 1u].indexRecords = records;
+            memcpy(stages[staged - 1u].indexField, record.indexField,
+                   sizeof(record.indexField));
+            stages[staged - 1u].indexOffset = record.indexOffset;
+        }
+        offset += (size_t) record.rowCount * record.stride +
+            (size_t) record.indexCount * sizeof(DatabaseStoreIndexRecord);
     }
     if (status == DATABASE_OK) {
         for (uint32_t i = 0u; i < staged; i++) {
@@ -1701,11 +1846,26 @@ static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
             (*entity).owned = 1u;
             stages[i].rows = nullptr;
             ChunkedList_free(oldRows);
-            indexInvalidate(entity); // the row list changed; the next query rebuilds
+            if (stages[i].indexRecords != nullptr) {
+                // The image carried an index: adopt its definition and records,
+                // which already point at the rows just published.
+                indexDrop(entity);
+                memcpy((*entity).indexField, stages[i].indexField,
+                       sizeof((*entity).indexField));
+                (*entity).indexOffset = stages[i].indexOffset;
+                (*entity).indexDirty = 0u;
+                (*entity).indexRecords = stages[i].indexRecords;
+                stages[i].indexRecords = nullptr;
+            } else {
+                indexInvalidate(entity); // changed rows; the next query rebuilds
+            }
         }
     }
-    for (uint32_t i = 0u; i < staged; i++)
+    for (uint32_t i = 0u; i < staged; i++) {
         freeOwnedRows(stages[i].rows);
+        if (stages[i].indexRecords != nullptr)
+            ChunkedList_free(stages[i].indexRecords);
+    }
     Memory_free(stages);
     return status;
 }
@@ -1976,6 +2136,19 @@ DatabaseCatalogEntry Database_storeCatalogEntry(Store *store, uint32_t wantedInd
             valid = false;
             break;
         }
+        size_t indexBytes = (size_t) record.indexCount *
+            sizeof(DatabaseStoreIndexRecord);
+        if (record.indexCount != 0u &&
+            (record.indexField[0] == '\0' || record.indexCount != record.rowCount ||
+             record.indexOffset > record.stride ||
+             sizeof(int32_t) > record.stride - record.indexOffset)) {
+            valid = false;
+            break;
+        }
+        if (indexBytes > length - recordOffset - rowBytes) {
+            valid = false;
+            break;
+        }
         if (i == wantedIndex) {
             memcpy(result.name, record.name, sizeof(result.name));
             result.rowStride = record.stride;
@@ -1983,7 +2156,7 @@ DatabaseCatalogEntry Database_storeCatalogEntry(Store *store, uint32_t wantedInd
             result.found = true;
             found = true;
         }
-        recordOffset += rowBytes;
+        recordOffset += rowBytes + indexBytes;
     }
     valid = valid && recordOffset == length;
     Memory_free(bytes);
