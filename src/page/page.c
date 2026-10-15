@@ -17,9 +17,10 @@
  *
  * The seal covers the header (excluding the seal field itself) and the in-use
  * payload, which deliberately includes the page's own ID and the store's page size.
- * That is what makes a misplaced page detectable: if a page is written at the wrong
- * offset, or read back under a different page size, its ID or size disagrees with the
- * seal and verification fails instead of handing the caller plausible garbage.
+ * That is what makes a misplaced page detectable: the caller compares its admitted
+ * ID with the expected offset. An ID changed without resealing, or bytes read back
+ * under a different page size, fail verification instead of handing the caller
+ * plausible garbage.
  *
  * The page owns no memory. It borrows storage from the caller — an arena block, a
  * mapping window, or a stack buffer in a test — so a page can be sealed straight
@@ -29,7 +30,9 @@
  *
  * A sealed page is immutable until reset. There is no in-place record edit, because
  * an edit after sealing would either invalidate the seal or force a re-seal of bytes
- * that are already durable. */
+ * that are already durable. Binding does not touch existing bytes. Cold load first
+ * verifies their stored length and seal, then adopts header state atomically under
+ * caller-owned serialization; a refusal leaves cached state and bytes intact. */
 ;;OVERVIEW
 /** ========================================================================
  * CLASS: Page (page/page.c)
@@ -38,9 +41,11 @@
  *   uint32_t size       the store's page size, power of two (sealed in)
  *   uint32_t id         this page's number within the file (sealed in)
  *   uint32_t kind       PageKind
+ *   uint32_t used       admitted in-use payload bytes
  *   int32_t lastCode    last PageCode refusal
  *   bool sealed         the seal field is valid
  *   bool dirty          caller changed bytes since the last seal
+ *
  * LAYOUT (byte-native, memory order, little-endian host floor)
  *   [0]  u32 magic      PAGE_MAGIC
  *   [4]  u32 id
@@ -51,24 +56,58 @@
  *   [24] u32 reserved
  *   [28] u32 seal       CRC32 over bytes [0..28) and the used payload
  *   [32..] payload
+ *
  * FUNCTION REGISTRY (exports)
- *   Constructors: Page_0(void), Page_2(bytes, size)
- *   Lifecycle:    Page_free, Page_sizeValid
- *   Writing:      Page_format, Page_reset, Page_append, Page_seal
- *   Verifying:    Page_verify, Page_code
- *   Accessors:    Page_payload, Page_payloadOf, Page_used, Page_capacity,
- *                 Page_freeSpace, Page_id, Page_kind, Page_size, Page_sealValue,
- *                 Page_isSealed, Page_isDirty, Page_markClean
- *   Naming:       Page_codeName, Page_kindName
- *   Projections:  Page_toString, Page_toStringStruct
+ *   Constructors / lifecycle:
+ *     Page *Page_0(void)
+ *     Page *Page_2(uint8_t *bytes, uint32_t size)
+ *     void Page_free(Page *self)
+ *     bool Page_sizeValid(uint32_t size)
+ *   Writing / admission:
+ *     PageCode Page_format(Page *self, uint32_t id, uint32_t kind)
+ *     PageCode Page_reset(Page *self, uint32_t kind)
+ *     PageCode Page_append(Page *self, const uint8_t *src, uint32_t length)
+ *     PageCode Page_seal(Page *self)
+ *     PageCode Page_verify(const Page *self)
+ *     PageCode Page_load(Page *self)
+ *   Accessors:
+ *     PageCode Page_code(const Page *self)
+ *     uint8_t *Page_payload(Page *self)
+ *     const uint8_t *Page_payloadOf(const Page *self)
+ *     uint32_t Page_used(const Page *self)
+ *     uint32_t Page_capacity(const Page *self)
+ *     uint32_t Page_freeSpace(const Page *self)
+ *     uint32_t Page_id(const Page *self)
+ *     uint32_t Page_kind(const Page *self)
+ *     uint32_t Page_size(const Page *self)
+ *     uint32_t Page_sealValue(const Page *self)
+ *     bool Page_isSealed(const Page *self)
+ *     bool Page_isDirty(const Page *self)
+ *     void Page_markClean(Page *self)
+ *   Naming / projections:
+ *     const char *Page_codeName(PageCode code)
+ *     const char *Page_kindName(uint32_t kind)
+ *     bool Page_toString(const Page *self, char *dest, size_t capacity,
+ *                        bool *outTruncated)
+ *     bool Page_toStringStruct(const Page *self, char *dest, size_t capacity,
+ *                              bool *outTruncated)
  * PRIVATE HELPERS
- *   putU32/getU32      explicit memory-order encoders (the format definition)
- *   payloadBytes(self) the borrowed payload area
- *   computeSeal(self)  the seal over header[0..28) plus the used payload
+ *   static void putU32(uint8_t *out, uint32_t value) — memory-order encoder
+ *   static uint32_t getU32(const uint8_t *in) — memory-order decoder
+ *   static uint8_t *payloadBytes(const Page *self) — borrowed payload area
+ *   static uint32_t computeSeal(const Page *self, uint32_t used) — bounded CRC
+ *   static void writeHeader(Page *self) — initialize an unsealed header
+ *   static Page *allocPage(void) — allocate only the Page owner
+ *   static bool writeNull(char *dest, size_t capacity, bool *outTruncated)
+ *     — bounded null-owner projection
  * CONTRACT: null storage, an illegal size, a bad argument, an overflowing append, a
  * mutation of a sealed page and a damaged page are each refused through THROW with
  * the page left as it was found. `Page_verify` never crashes on arbitrary bytes: a
- * wrong magic or size is INVALID, a wrong checksum is BAD_SEAL.
+ * wrong magic, size, bounds, kind or reserved word is INVALID, a wrong checksum is
+ * BAD_SEAL. Verification uses stored used, never the cached length. Load preserves
+ * all cached fields on failure; on success it adopts id/kind/used, marks sealed and
+ * clean and clears lastCode. Caller checks ID/location and excludes concurrent
+ * mutation/destruction; borrowed storage must remain live and fully sized.
  * ======================================================================== */
 
 static void putU32(uint8_t *out, uint32_t value) {
@@ -93,9 +132,9 @@ static uint8_t *payloadBytes(const Page *self) {
     return (*self).bytes + PAGE_HEADER_BYTES;
 }
 
-static uint32_t computeSeal(const Page *self) {
+static uint32_t computeSeal(const Page *self, uint32_t used) {
     uint32_t crc = Crc32_update(CRC32_SEED, (*self).bytes, PAGE_SEAL_OFFSET);
-    return Crc32_finalize(Crc32_update(crc, payloadBytes(self), (*self).used));
+    return Crc32_finalize(Crc32_update(crc, payloadBytes(self), used));
 }
 
 static void writeHeader(Page *self) {
@@ -204,7 +243,7 @@ PageCode Page_seal(Page *self) {
         THROW("Page_seal: no storage is bound");
         return PAGE_INVALID;
     }
-    putU32((*self).bytes + PAGE_SEAL_OFFSET, computeSeal(self));
+    putU32((*self).bytes + PAGE_SEAL_OFFSET, computeSeal(self, (*self).used));
     (*self).sealed = true;
     (*self).dirty = false;
     (*self).lastCode = PAGE_OK;
@@ -212,7 +251,7 @@ PageCode Page_seal(Page *self) {
 }
 
 PageCode Page_verify(const Page *self) {
-    if (self == nullptr || (*self).bytes == nullptr) {
+    if (self == nullptr || (*self).bytes == nullptr || !Page_sizeValid((*self).size)) {
         THROW("Page_verify: no storage is bound");
         return PAGE_INVALID;
     }
@@ -233,10 +272,29 @@ PageCode Page_verify(const Page *self) {
         THROW("Page_verify: the recorded payload length cannot fit the page");
         return PAGE_INVALID;
     }
-    if (getU32(bytes + PAGE_SEAL_OFFSET) != computeSeal(self)) {
+    if (getU32(bytes + 8u) > PAGE_KIND_CATALOG ||
+        getU32(bytes + 20u) != 0u || getU32(bytes + 24u) != 0u) {
+        THROW("Page_verify: unknown kind or nonzero reserved header words");
+        return PAGE_INVALID;
+    }
+    if (getU32(bytes + PAGE_SEAL_OFFSET) != computeSeal(self, used)) {
         THROW("Page_verify: the page seal does not match its bytes");
         return PAGE_BAD_SEAL;
     }
+    return PAGE_OK;
+}
+
+PageCode Page_load(Page *self) {
+    PageCode code = Page_verify(self);
+    if (code != PAGE_OK)
+        return code;
+    const uint8_t *bytes = (*self).bytes;
+    (*self).id = getU32(bytes + 4u);
+    (*self).kind = getU32(bytes + 8u);
+    (*self).used = getU32(bytes + 12u);
+    (*self).sealed = true;
+    (*self).dirty = false;
+    (*self).lastCode = PAGE_OK;
     return PAGE_OK;
 }
 
@@ -321,12 +379,12 @@ bool Page_toStringStruct(const Page *self, char *dest, size_t capacity, bool *ou
     if (self == nullptr)
         return writeNull(dest, capacity, outTruncated);
     int written = snprintf(dest, capacity,
-                           "Page{size=%u, id=%u, kind=%s, used=%u, free=%u, seal=%u, sealed=%d, "
-                           "dirty=%d, lastCode=%s}",
-                           Page_size(self), Page_id(self), Page_kindName(Page_kind(self)),
-                           Page_used(self), Page_freeSpace(self), Page_sealValue(self),
-                           Page_isSealed(self) ? 1 : 0, Page_isDirty(self) ? 1 : 0,
-                           Page_codeName(Page_code(self)));
+                           "Page{bytes=%p, size=%u, id=%u, kind=%s, used=%u, lastCode=%s, "
+                           "sealed=%d, dirty=%d, free=%u, seal=%u}",
+                           (void*) (*self).bytes, Page_size(self), Page_id(self),
+                           Page_kindName(Page_kind(self)), Page_used(self),
+                           Page_codeName(Page_code(self)), Page_isSealed(self) ? 1 : 0,
+                           Page_isDirty(self) ? 1 : 0, Page_freeSpace(self), Page_sealValue(self));
     bool cut = written < 0 || (size_t) written >= capacity;
     if (outTruncated != nullptr)
         *outTruncated = cut;

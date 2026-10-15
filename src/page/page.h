@@ -12,9 +12,10 @@
 // agree: the seal, the write, and the recovery decision.
 //
 // The seal is a CRC32 over the header (excluding the seal field) plus the in-use
-// payload. It deliberately covers the page's own ID and size, so a page written at
-// the wrong offset, or read back as a different size, fails verification instead of
-// being silently accepted as valid data.
+// payload. It deliberately covers the page's own ID and size, so a page whose
+// ID changed without resealing, or which is read back as a different size, fails
+// verification instead of being silently accepted as valid data. The caller checks
+// the admitted ID against its expected file location; Page has no offset context.
 //
 // Sizing: the page size is chosen once by the store, is a power of two within
 // [PAGE_SIZE_MIN, PAGE_SIZE_MAX], and is recorded in the page header so a mismatch
@@ -67,7 +68,8 @@ typedef struct Page {
 bool Page_sizeValid(uint32_t size);
 
 // Arity constructors: Page_0 has no storage; Page_2 binds borrowed storage of
-// `size` bytes. Null on refusal, with Page_code saying why.
+// `size` bytes without changing them or admitting their header. Null on refusal.
+// The caller retains the full live buffer and externally serializes all access.
 Page *Page_0(void);
 Page *Page_2(uint8_t *bytes, uint32_t size);
 #define Page(...) CONSTRUCTOR_DISPATCH(Page, __VA_ARGS__)
@@ -84,9 +86,15 @@ PageCode Page_reset(Page *self, uint32_t kind);
 PageCode Page_append(Page *self, const uint8_t *src, uint32_t length);
 // Store the seal. A sealed page is immutable until it is reset.
 PageCode Page_seal(Page *self);
-// Recompute the seal and compare. INVALID for a wrong magic or size (this is not a
-// page, or not one of ours), BAD_SEAL for a checksum mismatch.
+// Cold byte verification, independent of cached id/kind/used/sealed/dirty. INVALID
+// for illegal binding size, magic, stored size, used, kind or nonzero reserved
+// words; BAD_SEAL for a checksum mismatch. Never mutates bytes or cached state.
 PageCode Page_verify(const Page *self);
+// Cold admission of existing bytes: verify first, then adopt stored id/kind/used,
+// set sealed=true, dirty=false and lastCode=PAGE_OK. On refusal return the code
+// without changing ANY cached state (including lastCode) or bytes. Caller checks
+// the admitted ID against the expected file location before using the payload.
+PageCode Page_load(Page *self);
 
 PageCode    Page_code(const Page *self);
 uint8_t    *Page_payload(Page *self);           // borrowed, Page_used bytes long
