@@ -3,7 +3,7 @@
 Build with [b](https://github.com/vex-graph/b):
 `./tools/b build darkbase` from the workspace root.
 
-Store format (page-level implementation; relational integration pending): [`docs/store-format.md`](docs/store-format.md).
+Store format and initial Database page-chain bridge: [`docs/store-format.md`](docs/store-format.md).
 
 ## Current State
 
@@ -17,8 +17,14 @@ Store format (page-level implementation; relational integration pending): [`docs
 - **In-memory store** — `Database` registers reflection `Struct` entities and
   supports borrowed rows plus exact-stride owned copy-in; `DatabaseResult` is a
   dest-last cursor. Owner
-  tests `database_test` and `database_result_test` exist. Their graph execution is
-  currently blocked; those retained APIs were not re-proved in this Store cycle.
+  tests `database_test` and `database_result_test` exist. The independent strict
+  Database owner `python3 tests/darkbase-engine/database/run.py` now proves the
+  page-store whole-image roundtrip and reopen; the global graph remains blocked
+  before owner execution by the unrelated Vexspoke ownership ratchet.
+- **Structured equality query** — `Database_queryEqual` resolves one reflected
+  Field and returns exact-byte matches through a cursor. Its owner tests cover
+  zero/one/many matches and invalid schema/value spans. It is an in-memory linear
+  scan, not a persistent index, range query, numeric comparison or projection.
 - **Legacy snapshot compatibility slice** — `Database_save`/`Database_load`
   still read and write the superseded `.vexdb` M2 dump (64-byte `VEXDB01`
   header, flat row bytes by `Struct.size`, trailing CRC32). Load validates the
@@ -33,10 +39,13 @@ Store format (page-level implementation; relational integration pending): [`docs
   Its optimized/assertion-enabled and C ASan/UBSan tests exercise retained live
   pages, reservation/journal exhaustion, free-list reopen, child exits at actual
   commit boundaries, torn-data repair, and injected commit-stage IO failures.
-  This is not yet a durable relational `Database` adapter.
+  `Database_saveStore`/`Database_loadStore` now encode reflected catalog records
+  and row spans into linked page chains and publish via one root-page commit.
+  This is an initial whole-image bridge, not incremental rows or multi-page
+  transactions, and it bypasses the legacy M2 snapshot parser.
 
 **Stubbed, draft, or planned:** field-level predicates and an offset-based codec;
-Database mutation/replay integration with the page-level Store; embedded journal
+structured queries/catalog/indexes; embedded journal
 recycling/checkpoint compaction; catalog and ordered indexes; transactions;
 CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry

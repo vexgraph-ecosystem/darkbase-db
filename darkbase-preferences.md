@@ -203,6 +203,14 @@ before root publication preserves the previously selected image, while uncertain
 root commit requires close/reopen. This bridge does not provide checkpointing,
 schema migration, structured indexes, or make Store operations thread-safe.
 
+`Database_queryEqual` is the first structured query operation. It resolves one
+reflected Field cold, validates its nonzero span against the entity row stride,
+and compares exact bytes across the in-memory rows. It returns a cursor owning
+only its temporary row-pointer list; matching row values remain borrowed and the
+cursor must be freed before Database. It is not numeric comparison, projection,
+ordering, range querying, persistent catalog lookup, or an index. Database and
+query results remain caller-serialized/owner-affine.
+
 The caller owns one serialization/exclusion domain, stable trusted paths and
 all external alias/truncation exclusion. No OS lock or hostile-writer sandbox
 is inferred. Geometry, owned pointers, page count, free head, sequence and
