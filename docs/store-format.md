@@ -1,7 +1,8 @@
 # darkbase store format — v1 specification
 
-**Status: page-level Store implemented; relational/catalog/index integration and
-journal reclamation remain unimplemented.** This supersedes the M2 dump format
+**Status: page-level Store and an initial whole-Database page-chain bridge are
+implemented; relational indexes, multi-page transactions and journal reclamation
+remain unimplemented.** This supersedes the M2 dump format
 (`VEXDB01`: 64-byte header, flat rows by `Struct.size`, trailing CRC32), which cannot
 represent a message longer than one fixed slot and rewrites the whole store on every
 save. Its legacy implementation remains available for compatibility; no migration
@@ -126,7 +127,8 @@ at 12, u64 virtual reservation at 16, u64 journal bytes at 24, u64 data offset a
 32, then 24 zero reserved bytes. The containing Page seal covers it. The full
 mutable header originally specified above is not independently overwritten:
 allocation high-water count, free-list head and applied sequence are reconstructed
-from retained redo. Root is reserved at zero; no tree/catalog root is implemented.
+from retained redo. The generic Store has no catalog tree or root; the Database
+bridge below reserves logical data-page id 1 as its own snapshot publication root.
 Native integer memory order is intentional on the little-endian host floor.
 
 Each redo payload is 32 bytes plus a complete sealed page image: u32 redo magic
@@ -150,6 +152,25 @@ refusal preserves existing data and is counted, with one exhaustion diagnostic
 per owner epoch. Releasing data pages does not reclaim redo capacity. `Store_sync`
 does not checkpoint. A safe journal rollover/checkpoint format remains future
 work rather than silently calling standalone Wal's destructive truncation API.
+
+## Database page-chain bridge (initial whole-image slice)
+
+`Database_saveStore` and `Database_loadStore` connect the existing reflected
+entity/owned-row API to the page-level Store. Page id 1 is a `PAGE_KIND_CATALOG`
+root record. It points to linked `PAGE_KIND_LEAF` chunks containing the existing
+M2 byte payload (entity names, row strides/counts and raw row bytes). Callers
+register the same reflection `Struct`s before loading; the normal staged loader
+validates schemas and publishes owned rows only after the complete image passes.
+
+Save writes and syncs every new chunk through Store before replacing the root in
+one page commit. A rejected write before root publication leaves the prior root
+selected after close/reopen, although already committed unreferenced chunks can
+consume data pages. Old successful snapshots are not reclaimed by this bridge;
+each save rewrites the complete image, so both data reservation and retained WAL
+can exhaust. This is a first Database/Store integration seam, not incremental row
+storage, a multi-page transaction API, a B-tree, schema evolution, or a replacement
+for the legacy `Database_save`/`Database_load` compatibility calls. A failed root
+commit has Store's existing uncertain-outcome rule and requires close/reopen.
 
 Caller exclusion covers the complete mapping/descriptor lifetime, including the
 cold bootstrap path read before Rust mapping admission. No alias, OS-lock or

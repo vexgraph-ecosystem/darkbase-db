@@ -192,6 +192,16 @@ safe journal recycling/checkpoint compaction remains unimplemented, and writes
 refuse/count when its explicit capacity or the data reservation is exhausted.
 `Store_sync` never truncates or retires this embedded history.
 
+`Database_saveStore`/`Database_loadStore` provide the initial Database bridge:
+the complete existing reflected-row snapshot is split into leaf-page chunks and
+published through one catalog root-page replacement. Loading requires the same
+schemas registered first and uses the existing staged owned-row admission. This
+is whole-image persistence, not incremental row addressing or a multi-page
+transaction. Old snapshot pages and redo records are retained; capacity refusal
+before root publication preserves the previously selected image, while uncertain
+root commit requires close/reopen. This bridge does not provide checkpointing,
+schema migration, structured indexes, or make Store operations thread-safe.
+
 The caller owns one serialization/exclusion domain, stable trusted paths and
 all external alias/truncation exclusion. No OS lock or hostile-writer sandbox
 is inferred. Geometry, owned pointers, page count, free head, sequence and
