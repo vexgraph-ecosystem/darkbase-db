@@ -92,6 +92,10 @@
  *     uint32_t nextPage, chunkBytes; uint64_t offset;
  *     // linked data chunk; offsets must be contiguous while loading
  *   }
+ *   DatabaseStoreCatalog { char magic[8]; uint32_t version, entityCount }
+ *     catalog byte-stream header.
+ *   DatabaseStoreEntity { char name[24]; uint32_t stride, rowCount }
+ *     one reflected entity descriptor followed by its raw row bytes.
  *
  * PRIVATE HELPERS (persistence, pure logic):
  *   writeAll(file, src, length)             // short-write-safe (static)
@@ -100,9 +104,10 @@
  *   loadPayload(self, bytes, len, count)         // validate snapshot records (static)
  *   loadCommit(self, bytes, len, count)          // stage rows then publish atomically (static)
  *   freeOwnedRows(rows)                          // free staged owned copies (static)
- *   databaseSnapshotBytes(self, outLength)       // serialize M2 payload to owned bytes (static)
+ *   databaseStoreCatalogBytes(self, outLength)   // serialize catalog + rows (static)
  *   databaseStoreReadRoot(store, pageBytes, outRoot) // validate root page (static)
  *   databaseStoreEnsureRoot(store)               // seed/validate page id 1 (static)
+ *   databaseStoreLoadCommit(self, bytes, length)  // stage and publish rows atomically (static)
  *
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
@@ -603,9 +608,26 @@ typedef struct DatabaseStoreLink {
 } DatabaseStoreLink;
 _Static_assert(sizeof(DatabaseStoreLink) == 16u, "DatabaseStoreLink must stay 16 Bytes");
 
+typedef struct DatabaseStoreCatalog {
+    char magic[8];
+    uint32_t version;
+    uint32_t entityCount;
+} DatabaseStoreCatalog;
+_Static_assert(sizeof(DatabaseStoreCatalog) == 16u,
+               "DatabaseStoreCatalog must stay 16 Bytes");
+
+typedef struct DatabaseStoreEntity {
+    char name[DB_ENTITY_NAME_BYTES];
+    uint32_t stride;
+    uint32_t rowCount;
+} DatabaseStoreEntity;
+_Static_assert(sizeof(DatabaseStoreEntity) == 32u,
+               "DatabaseStoreEntity must stay 32 Bytes");
+
 #define DATABASE_STORE_ROOT_ID 1u
 #define DATABASE_STORE_VERSION 1u
 #define DATABASE_STORE_ROOT_MAGIC "DBROOT01"
+#define DATABASE_STORE_CATALOG_MAGIC "DBCAT001"
 
 /**
  * Writes the full byte span, retrying short writes; returns false on a
@@ -691,7 +713,7 @@ static int32_t loadPayload(Database *self, const uint8_t *payload, size_t length
             }
             if (memchr(previous.name, '\0', sizeof(previous.name)) == nullptr)
                 return DATABASE_INVALID;
-            if (strcmp(previous.name, record.name) == 0)
+            if (Database_entityIndex(self, previous.name) == index)
                 return DATABASE_DUPLICATE;
         }
         offset += rowBytes;
@@ -968,43 +990,40 @@ int32_t Database_load(Database *self, const char *path) {
     return DATABASE_OK;
 }
 
-/** Serializes the current schemas and rows into the established M2 byte payload. */
-static uint8_t *databaseSnapshotBytes(Database *self, size_t *outLength) {
+/** Serializes an explicit reflected catalog followed by entity row spans. */
+static uint8_t *databaseStoreCatalogBytes(Database *self, size_t *outLength) {
     if (outLength != nullptr)
         *outLength = 0u;
     uint32_t entityCount = Database_entityCount(self);
-    size_t length = sizeof(VexDbHeader) + VEX_DB_TRAILER_BYTES;
-    uint64_t rowTotal = 0u;
+    size_t length = sizeof(DatabaseStoreCatalog);
     for (uint32_t e = 0u; e < entityCount; e++) {
         DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, e);
         if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr)
             return nullptr;
         uint32_t stride = Struct_getSize((*entity).schema);
         uint32_t count = ChunkedList_size((*entity).rows);
-        if (stride == 0u || (size_t) count > (SIZE_MAX - sizeof(VexDbEntity)) / stride)
+        if (stride == 0u || (size_t) count > (SIZE_MAX - sizeof(DatabaseStoreEntity)) / stride)
             return nullptr;
         size_t rowBytes = (size_t) count * stride;
-        if (length > SIZE_MAX - sizeof(VexDbEntity) - rowBytes)
+        if (length > SIZE_MAX - sizeof(DatabaseStoreEntity) - rowBytes)
             return nullptr;
-        length += sizeof(VexDbEntity) + rowBytes;
-        rowTotal += count;
+        length += sizeof(DatabaseStoreEntity) + rowBytes;
     }
     uint8_t *bytes = (uint8_t*) Memory_alloc(0u, length);
     if (bytes == nullptr)
         return nullptr;
-    VexDbHeader header;
-    memset(&header, 0, sizeof(header));
-    memcpy(header.magic, VEX_DB_MAGIC, 7u);
-    header.version = VEX_DB_VERSION;
-    header.entityCount = entityCount;
-    header.rowCount = rowTotal;
-    memcpy(bytes, &header, sizeof(header));
-    size_t offset = sizeof(header);
+    DatabaseStoreCatalog catalog;
+    memset(&catalog, 0, sizeof(catalog));
+    memcpy(catalog.magic, DATABASE_STORE_CATALOG_MAGIC, sizeof(catalog.magic));
+    catalog.version = DATABASE_STORE_VERSION;
+    catalog.entityCount = entityCount;
+    memcpy(bytes, &catalog, sizeof(catalog));
+    size_t offset = sizeof(catalog);
     for (uint32_t e = 0u; e < entityCount; e++) {
         DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, e);
         uint32_t stride = Struct_getSize((*entity).schema);
         uint32_t count = ChunkedList_size((*entity).rows);
-        VexDbEntity record;
+        DatabaseStoreEntity record;
         memset(&record, 0, sizeof(record));
         memcpy(record.name, (*entity).name, sizeof(record.name));
         record.stride = stride;
@@ -1022,11 +1041,8 @@ static uint8_t *databaseSnapshotBytes(Database *self, size_t *outLength) {
             offset += stride;
         }
     }
-    uint32_t crc = Crc32_finalize(Crc32_update(CRC32_SEED, bytes + sizeof(header),
-                                               offset - sizeof(header)));
-    memcpy(bytes + offset, &crc, sizeof(crc));
     if (outLength != nullptr)
-        *outLength = length;
+        *outLength = offset;
     return bytes;
 }
 
@@ -1068,6 +1084,123 @@ static bool databaseStoreEnsureRoot(Store *store) {
         pageId == DATABASE_STORE_ROOT_ID;
 }
 
+/** Validates a Store catalog and atomically publishes owned row lists. */
+static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
+                                       size_t length) {
+    if (length < sizeof(DatabaseStoreCatalog))
+        return DATABASE_CORRUPT;
+    DatabaseStoreCatalog catalog;
+    memcpy(&catalog, bytes, sizeof(catalog));
+    if (memcmp(catalog.magic, DATABASE_STORE_CATALOG_MAGIC, sizeof(catalog.magic)) != 0 ||
+        catalog.version != DATABASE_STORE_VERSION ||
+        (size_t) catalog.entityCount > (length - sizeof(catalog)) /
+            sizeof(DatabaseStoreEntity))
+        return DATABASE_CORRUPT;
+
+    size_t offset = sizeof(catalog);
+    for (uint32_t e = 0u; e < catalog.entityCount; e++) {
+        if (offset > length || length - offset < sizeof(DatabaseStoreEntity))
+            return DATABASE_CORRUPT;
+        DatabaseStoreEntity record;
+        memcpy(&record, bytes + offset, sizeof(record));
+        offset += sizeof(record);
+        if (record.stride == 0u || memchr(record.name, '\0', sizeof(record.name)) == nullptr ||
+            (size_t) record.rowCount > SIZE_MAX / record.stride)
+            return DATABASE_CORRUPT;
+        size_t rowBytes = (size_t) record.rowCount * record.stride;
+        if (rowBytes > length - offset)
+            return DATABASE_CORRUPT;
+        int32_t index = Database_entityIndex(self, record.name);
+        if (index < 0)
+            return DATABASE_ABSENT;
+        DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, (uint32_t) index);
+        if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr)
+            return DATABASE_ABSENT;
+        if (Struct_getSize((*entity).schema) != record.stride)
+            return DATABASE_INVALID;
+        if (ChunkedList_size((*entity).rows) != 0u)
+            return DATABASE_DUPLICATE;
+        size_t priorOffset = sizeof(catalog);
+        for (uint32_t prior = 0u; prior < e; prior++) {
+            DatabaseStoreEntity previous;
+            memcpy(&previous, bytes + priorOffset, sizeof(previous));
+            if (strcmp(previous.name, record.name) == 0)
+                return DATABASE_DUPLICATE;
+            priorOffset += sizeof(previous) + (size_t) previous.rowCount * previous.stride;
+        }
+        offset += rowBytes;
+    }
+    if (offset != length)
+        return DATABASE_CORRUPT;
+    if (catalog.entityCount == 0u)
+        return DATABASE_OK;
+    if ((size_t) catalog.entityCount > SIZE_MAX / sizeof(DbLoadStage))
+        return DATABASE_EXHAUSTED;
+    size_t stageBytes = (size_t) catalog.entityCount * sizeof(DbLoadStage);
+    DbLoadStage *stages = (DbLoadStage*) Memory_alloc(0u, stageBytes);
+    if (stages == nullptr)
+        return DATABASE_EXHAUSTED;
+    memset(stages, 0, stageBytes);
+    offset = sizeof(catalog);
+    int32_t status = DATABASE_OK;
+    uint32_t staged = 0u;
+    for (uint32_t e = 0u; e < catalog.entityCount && status == DATABASE_OK; e++) {
+        DatabaseStoreEntity record;
+        memcpy(&record, bytes + offset, sizeof(record));
+        offset += sizeof(record);
+        int32_t index = Database_entityIndex(self, record.name);
+        DbEntity *entity = index < 0 ? nullptr : (DbEntity*) ChunkedList_slot(
+            (*self).entities, (uint32_t) index);
+        if (entity == nullptr) {
+            status = DATABASE_ABSENT;
+            break;
+        }
+        ChunkedList *rows = ChunkedList_3(ID_DB_DATABASE_ROW,
+            (uint32_t) sizeof(void*), (*self).chunkBytes);
+        if (rows == nullptr) {
+            status = DATABASE_EXHAUSTED;
+            break;
+        }
+        stages[staged].entity = entity;
+        stages[staged].rows = rows;
+        staged++;
+        if (!ChunkedList_reserve(rows, record.rowCount)) {
+            status = DATABASE_EXHAUSTED;
+            break;
+        }
+        for (uint32_t r = 0u; r < record.rowCount; r++) {
+            void *copy = Memory_alloc(TYPE_DB_DATABASE_ROW_SINGLETON, record.stride);
+            if (copy == nullptr) {
+                status = DATABASE_EXHAUSTED;
+                break;
+            }
+            memcpy(copy, bytes + offset + (size_t) r * record.stride, record.stride);
+            uint8_t *slot = ChunkedList_addSlot(rows);
+            if (slot == nullptr) {
+                Memory_free(copy);
+                status = DATABASE_EXHAUSTED;
+                break;
+            }
+            *((void**) slot) = copy;
+        }
+        offset += (size_t) record.rowCount * record.stride;
+    }
+    if (status == DATABASE_OK) {
+        for (uint32_t i = 0u; i < staged; i++) {
+            DbEntity *entity = stages[i].entity;
+            ChunkedList *oldRows = (*entity).rows;
+            (*entity).rows = stages[i].rows;
+            (*entity).owned = 1u;
+            stages[i].rows = nullptr;
+            ChunkedList_free(oldRows);
+        }
+    }
+    for (uint32_t i = 0u; i < staged; i++)
+        freeOwnedRows(stages[i].rows);
+    Memory_free(stages);
+    return status;
+}
+
 /** Publishes page-chain bytes, then atomically replaces the root page. */
 int32_t Database_saveStore(Database *self, Store *store) {
     if (self == nullptr || store == nullptr || !Store_isOpen(store)) {
@@ -1081,10 +1214,10 @@ int32_t Database_saveStore(Database *self, Store *store) {
         return DATABASE_IO;
     }
     size_t length = 0u;
-    uint8_t *bytes = databaseSnapshotBytes(self, &length);
+    uint8_t *bytes = databaseStoreCatalogBytes(self, &length);
     if (bytes == nullptr) {
-        recordError(self, DATABASE_EXHAUSTED, "saveStore: snapshot serialization failed");
-        THROW("Database_saveStore: snapshot serialization failed");
+        recordError(self, DATABASE_EXHAUSTED, "saveStore: catalog serialization failed");
+        THROW("Database_saveStore: catalog serialization failed");
         return DATABASE_EXHAUSTED;
     }
     uint32_t pageSize = Store_pageSize(store);
@@ -1156,8 +1289,12 @@ int32_t Database_loadStore(Database *self, Store *store) {
     }
     DatabaseStoreRoot root;
     bool rootOk = databaseStoreReadRoot(store, pageBytes, &root);
+    uint32_t pageCount = Store_pageCount(store);
+    size_t chunkCapacity = (size_t) pageSize - PAGE_HEADER_BYTES - sizeof(DatabaseStoreLink);
+    size_t maxCatalogBytes = pageCount > 1u ?
+        (size_t) (pageCount - 1u) * chunkCapacity : 0u;
     if (!rootOk || root.length == 0u || (uint64_t) (size_t) root.length != root.length ||
-        root.length > (uint64_t) Store_reserved(store)) {
+        root.length > maxCatalogBytes) {
         Memory_free(pageBytes);
         recordError(self, DATABASE_CORRUPT, "loadStore: root page is absent or invalid");
         THROW("Database_loadStore: root page is absent or invalid");
@@ -1211,28 +1348,7 @@ int32_t Database_loadStore(Database *self, Store *store) {
         THROW("Database_loadStore: page chain or snapshot checksum rejected");
         return DATABASE_CORRUPT;
     }
-    VexDbHeader header;
-    if (length < sizeof(header) + VEX_DB_TRAILER_BYTES) {
-        Memory_free(bytes);
-        recordError(self, DATABASE_CORRUPT, "loadStore: snapshot header truncated");
-        THROW("Database_loadStore: snapshot header truncated");
-        return DATABASE_CORRUPT;
-    }
-    memcpy(&header, bytes, sizeof(header));
-    uint32_t storedCrc = 0u;
-    memcpy(&storedCrc, bytes + length - sizeof(storedCrc), sizeof(storedCrc));
-    uint32_t actualCrc = Crc32_finalize(Crc32_update(CRC32_SEED,
-        bytes + sizeof(header), length - sizeof(header) - sizeof(storedCrc)));
-    int32_t status = DATABASE_INVALID;
-    if (memcmp(header.magic, VEX_DB_MAGIC, 7u) == 0 &&
-        header.version == VEX_DB_VERSION && storedCrc == actualCrc) {
-        size_t payloadLength = length - sizeof(header) - sizeof(storedCrc);
-        status = loadPayload(self, bytes + sizeof(header), payloadLength,
-                             header.entityCount);
-        if (status == DATABASE_OK)
-            status = loadCommit(self, bytes + sizeof(header), payloadLength,
-                                header.entityCount);
-    }
+    int32_t status = databaseStoreLoadCommit(self, bytes, length);
     Memory_free(bytes);
     if (status != DATABASE_OK) {
         recordError(self, status, "loadStore: registered schemas rejected snapshot");
