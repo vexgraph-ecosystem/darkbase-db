@@ -288,8 +288,8 @@ int32_t Database_define(Database *self, Struct *schema) {
         THROW("Database_define: null database or schema");
         return -1;
     }
-    char name[DB_ENTITY_NAME_BYTES];
-    if (Struct_getName(name, sizeof(name), schema) < 0) {
+    const char *name = Struct_getName(schema);
+    if (name == nullptr) {
         recordError(self, DATABASE_INVALID, "define: schema has no valid name");
         THROW("Database_define: schema has no valid name");
         return -1;
