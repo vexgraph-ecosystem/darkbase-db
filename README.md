@@ -25,6 +25,10 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
   Field and returns exact-byte matches through a cursor. Its owner tests cover
   zero/one/many matches and invalid schema/value spans. It is an in-memory linear
   scan, not a persistent index, range query, numeric comparison or projection.
+- **Persisted catalog inspection** — `Database_storeCatalogEntry` returns a
+  copied name/stride/row-count record by catalog position. The committed page
+  chain and checksum are validated before returning it; the result survives Store
+  close. Schema registration is still caller-supplied before loading rows.
 - **Legacy snapshot compatibility slice** — `Database_save`/`Database_load`
   still read and write the superseded `.vexdb` M2 dump (64-byte `VEXDB01`
   header, flat row bytes by `Struct.size`, trailing CRC32). Load validates the
@@ -44,9 +48,9 @@ Store format and initial Database page-chain bridge: [`docs/store-format.md`](do
   This is an initial whole-image bridge, not incremental rows or multi-page
   transactions, and it bypasses the legacy M2 snapshot parser.
 
-**Stubbed, draft, or planned:** field-level predicates and an offset-based codec;
-structured queries/catalog/indexes; embedded journal
-recycling/checkpoint compaction; catalog and ordered indexes; transactions;
+**Stubbed, draft, or planned:** field projection, additional predicates and an
+offset-based codec; persistent indexes/range queries; embedded journal
+recycling/checkpoint compaction; transactions;
 CSV/JSON/manifest and generated-header export; reactive
 `DbTrigger` programs; external drivers; the R5 `darkbase` executable. Registry
 ids are declared ahead of their classes.

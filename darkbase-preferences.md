@@ -211,6 +211,12 @@ cursor must be freed before Database. It is not numeric comparison, projection,
 ordering, range querying, persistent catalog lookup, or an index. Database and
 query results remain caller-serialized/owner-affine.
 
+`Database_storeCatalogEntry` returns one copied persisted entity descriptor by
+catalog index after validating the root, page chain, checksum and record spans.
+The value contains name, row stride and row count and does not borrow Store
+memory. It supports discovery only; loading data still requires the caller to
+register matching reflected schemas.
+
 The caller owns one serialization/exclusion domain, stable trusted paths and
 all external alias/truncation exclusion. No OS lock or hostile-writer sandbox
 is inferred. Geometry, owned pointers, page count, free head, sequence and

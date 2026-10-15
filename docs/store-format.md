@@ -163,6 +163,13 @@ row strides and counts, followed by each entity's raw row spans. Callers registe
 the same reflection `Struct`s before loading; the Store loader validates the
 complete catalog and schemas, then stages owned rows before publishing them.
 
+`Database_storeCatalogEntry(store, index)` exposes one copied catalog descriptor
+after validating the selected root, page chain, checksum and every record span.
+Its `DatabaseCatalogEntry` value contains the entity name, row stride and row
+count and remains usable after Store close. An out-of-range index returns
+`DATABASE_ABSENT` loudly. This is metadata inspection, not schema reconstruction:
+the caller still supplies matching reflected `Struct`s before loading rows.
+
 Save writes and syncs every new chunk through Store before replacing the root in
 one page commit. A rejected write before root publication leaves the prior root
 selected after close/reopen, although already committed unreferenced chunks can
