@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "c23/constructor.h"
 
 // wal/wal.h — the write-ahead log: the reason a crash mid-write is survivable.
 //
@@ -15,11 +16,11 @@
 // because a hole in a log means the order cannot be trusted.
 //
 // The log borrows the engine's `File` for all IO: there is no second file layer and
-// no second CRC here. It owns no allocation: append writes the record in place, and
+// no second CRC here. Append/replay own no temporary allocation: append writes the record in place, and
 // replay streams payloads through a buffer the CALLER supplies, refusing a record
 // that does not fit rather than truncating it.
 //
-// Not offered: transactions across entities, group commit, a size ceiling,
+// Not offered: transactions across entities, group commit, a standalone size ceiling,
 // compression, a background fsync thread, or any claim about the data file's own
 // atomicity. `checkpoint` truncates the log; making the data durable first is the
 // caller's ordering obligation and is stated as such.
@@ -33,6 +34,10 @@
 #define WAL_HEADER_BYTES    24u   // magic, version, reserved, baseSequence, reserved, crc
 #define WAL_RECORD_FIXED    20u   // magic, op, sequence, length (then payload, then crc)
 #define WAL_PAYLOAD_MAX  (1u << 20)
+// Region v3 places its publication marker BEFORE the length-bearing record body.
+#define WAL_REGION_VERSION 3u
+#define WAL_COMMIT_BYTES 8u
+#define WAL_COMMIT_MAGIC UINT64_C(0x54494d4d4f435857)
 
 typedef enum WalCode {
     WAL_OK = 0,
@@ -41,6 +46,7 @@ typedef enum WalCode {
     WAL_CORRUPT = 3,     // a complete record failed its checksum (never skipped)
     WAL_TRUNCATED = 4,   // an incomplete trailing record was dropped
     WAL_CLOSED = 5,      // the owner is not open
+    WAL_FULL = 6,        // caller-selected region capacity exhausted
 } WalCode;
 
 typedef enum WalOp {
@@ -59,7 +65,8 @@ typedef struct WalRecord {
     uint32_t length;
 } WalRecord;
 
-// Return false to stop the walk early; the log itself is still intact.
+// Standalone: false stops successfully. Region: false is WAL_INVALID (including
+// on the final record), so a refused redo can never be mistaken for success.
 typedef bool (*WalVisitFn)(void *context, const WalRecord *record);
 
 typedef struct Wal {
@@ -72,12 +79,26 @@ typedef struct Wal {
     int32_t lastCode;        // last WalCode refusal
     bool tailTorn;           // recovery found an incomplete trailing record
     bool open;
+    uint64_t offset;         // absolute region start; zero for standalone
+    uint64_t capacity;       // finite region extent including its header
+    uint64_t end;            // relative append position, adopted only on open/append
+    uint64_t exhaustionCount;
+    bool region;
+    bool poisoned;          // failed IO/corruption requires close and reopen
 } Wal;
 
 // Arity constructors: Wal_0 is a closed owner, Wal_1 creates or opens the log at
-// `path` and recovers its tail. Null on refusal; Wal_code says why.
+// `path` and recovers its tail. Invalid constructor arguments return null; file or
+// format failures return an owner whose Wal_code reports the refusal. Wal_3 keeps
+// such an owner closed; Wal_1 retains its legacy open-state behavior.
 Wal *Wal_0(void);
 Wal *Wal_1(const char *path);
+// Existing regular file only; trusted host excludes every alias. No create,
+// resize or checkpoint. Capacity is an explicit finite journal safety bound.
+// Region record bytes are synced BEFORE publishing the commit marker; caller
+// must Wal_sync the marker BEFORE applying redo to data pages. IO failure poisons
+// this owner until reopen. An uncommitted tail is ignored and overwritten.
+Wal *Wal_3(const char *path, uint64_t offset, uint64_t capacity);
 #define Wal(...) CONSTRUCTOR_DISPATCH(Wal, __VA_ARGS__)
 #define Wal_zero() Wal_0()
 
@@ -90,6 +111,8 @@ uint64_t    Wal_baseSequence(const Wal *self);
 uint32_t    Wal_count(const Wal *self);
 uint32_t    Wal_recovered(const Wal *self);
 bool        Wal_tailTorn(const Wal *self);
+uint64_t    Wal_remaining(const Wal *self);
+uint64_t    Wal_exhaustionCount(const Wal *self);
 
 // Append one intent. Writes the record and does NOT sync: `Wal_sync` is the
 // durability boundary, and the caller acknowledges a mutation only after it.
