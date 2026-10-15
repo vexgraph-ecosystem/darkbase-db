@@ -17,14 +17,14 @@
  * DEFINITION: DatabaseResult
  * ============================================================================
  * DatabaseResult is the dest-last cursor over one entity's live rows. It
- * borrows the entity's row-pointer ChunkedList (owned by Database) and holds a
+ * borrows an entity's row-pointer ChunkedList or owns a query's temporary
+ * pointer-list container, and holds a
  * count snapshot plus an integer cursor, so stepping never allocates and never
  * copies a row: next() reads the stable row slot and writes the bound pointer
  * into the caller's destination. Rows are the caller's own live struct
- * instances; this class never owns or frees them. Cold path only (a query
- * cursor is a cold rendezvous, the Cold-Only Reflection Law). Lifetime: the
- * result is arena-allocated and must not outlive its Database or race a
- * concurrent mutation of the borrowed list.
+ * instances; this class never owns or frees row values. Cold path only (a query
+ * cursor is a cold rendezvous, the Cold-Only Reflection Law). Lifetime: free a
+ * result before its Database and never race mutation of either list.
  * ============================================================================
  */
 
@@ -38,16 +38,17 @@
  * STRUCT FIELDS (Mirroring database/database_result.h):
  * ----------------------------------------------------------------------------
  *   DatabaseResult {
- *     ChunkedList *rows; // borrowed row-pointer source
+ *     ChunkedList *rows; // row-pointer list; ownership of container is explicit
  *     uint32_t count;    // published rows snapshot
  *     uint32_t cursor;   // next row index
+ *     uint32_t ownsRows; // owns list container only, never row values
  *   }
  *
  * PRIVATE HELPERS (kept file-local, pure logic, no behavior of their own): none.
  *
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
- * Public Constructors: (.h) DatabaseResult_0(), _1(source)
+ * Public Constructors: (.h) DatabaseResult_0(), _1(source), _2(source, ownsSource)
  * Public Core Functions: (.h) _kind, _check, _next, _count, _position, _rewind
  * Public String Projections: (.h) _toString / _toStringStruct
  * ============================================================================
@@ -66,6 +67,7 @@ DatabaseResult *DatabaseResult_0(void) {
     (*self).rows = nullptr;
     (*self).count = 0u;
     (*self).cursor = 0u;
+    (*self).ownsRows = 0u;
     return self;
 }
 
@@ -74,8 +76,13 @@ DatabaseResult *DatabaseResult_0(void) {
  * length; a null source is rejected and returns nullptr.
  */
 DatabaseResult *DatabaseResult_1(ChunkedList *source) {
+    return DatabaseResult_2(source, false);
+}
+
+/** Allocates a cursor and optionally owns only its row-pointer list container. */
+DatabaseResult *DatabaseResult_2(ChunkedList *source, bool ownsSource) {
     if (source == nullptr) {
-        THROW("DatabaseResult_1: null row source");
+        THROW("DatabaseResult_2: null row source");
         return nullptr;
     }
     DatabaseResult *self = DatabaseResult_0();
@@ -83,15 +90,20 @@ DatabaseResult *DatabaseResult_1(ChunkedList *source) {
         return nullptr;
     (*self).rows = source;
     (*self).count = ChunkedList_size(source);
+    (*self).ownsRows = ownsSource ? 1u : 0u;
     return self;
 }
 
 /**
- * Releases the arena-allocated cursor without freeing its borrowed row list.
+ * Releases the cursor and its list container only when ownsRows is set; row
+ * values are always borrowed.
  */
 void DatabaseResult_free(DatabaseResult *self) {
-    if (self != nullptr)
+    if (self != nullptr) {
+        if ((*self).ownsRows != 0u)
+            ChunkedList_free((*self).rows);
         Memory_free(self);
+    }
 }
 
 // CORE FUNCTIONS
@@ -190,8 +202,10 @@ void DatabaseResult_toStringStruct(const DatabaseResult *self, char *dest, size_
         snprintf(dest, cap, "nullptr");
         return;
     }
-    int written = snprintf(dest, cap, "DatabaseResult { rows=0x%llx, count=%u, cursor=%u }",
-                           (unsigned long long) (uintptr_t) (*self).rows, (*self).count, (*self).cursor);
+    int written = snprintf(dest, cap,
+        "DatabaseResult { rows=0x%llx, count=%u, cursor=%u, ownsRows=%u }",
+        (unsigned long long) (uintptr_t) (*self).rows, (*self).count,
+        (*self).cursor, (*self).ownsRows);
     if (written < 0 || (size_t) written >= cap) {
         if (outTruncated)
             *outTruncated = true;
