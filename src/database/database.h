@@ -93,6 +93,13 @@ void *Database_row(const Database *self, const char *entity, uint32_t index);
 uint32_t Database_count(const Database *self, const char *entity);
 // A fresh dest-last cursor over an entity's rows, or null when absent.
 DatabaseResult *Database_select(Database *self, const char *entity);
+// Cold raw-byte equality predicate over one reflected Field. The Field must
+// have a nonzero in-row size and a range contained in Struct.size. Result owns
+// its pointer-list container but borrows the matching row values; free it before
+// Database. Equal values use exact byte equality, not numeric conversion.
+DatabaseResult *Database_queryEqual(Database *self, const char *entity,
+                                    const char *field, const void *value,
+                                    size_t valueLength);
 
 // --- Persistence (M2, .vexdb) ---
 // Serialize the registry and bound rows to a native-endian .vexdb file, or load

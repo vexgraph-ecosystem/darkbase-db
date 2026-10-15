@@ -113,11 +113,15 @@
  * ----------------------------------------------------------------------------
  * Public Constructors: (.h) Database_0(), _1(chunkBytes), _init, _free
  * Public Core Functions: (.h) _kind, _check, _define, _entityIndex, _entityCount,
- *                             _schema, _insert, _insertOwned, _row, _count, _select
+ *                             _schema, _insert, _insertOwned, _row, _count, _select,
+ *                             _queryEqual
  * Public Persistence: (.h) _save, _load
  *                      _saveStore, _loadStore (caller-owned page Store)
  *   int32_t Database_saveStore(Database *self, Store *store)
  *   int32_t Database_loadStore(Database *self, Store *store)
+ * Public Structured Query:
+ *   DatabaseResult *Database_queryEqual(Database *self, const char *entity,
+ *       const char *field, const void *value, size_t valueLength)
  * Public Diagnostics: (.h) _errorCode, _lastError, _errorText
  * Public String Projections: (.h) _toString / _toStringStruct
  * CONTRACT: schemas and borrowed rows outlive Database; owned rows are copied
@@ -129,6 +133,9 @@
  * multi-page transactions, indexing, or journal recycling. A failed data-chain
  * write leaves the prior root intact; uncertain root-commit failure requires
  * Store close/reopen before further use.
+ * queryEqual validates one reflected Field span and scans rows for exact byte
+ * equality. It allocates an owned pointer-list container, borrows matched rows,
+ * and returns no numeric coercion, ordering, planner or persistent index.
  * ============================================================================
  */
 
@@ -510,6 +517,105 @@ DatabaseResult *Database_select(Database *self, const char *entity) {
     }
     recordError(self, DATABASE_OK, "");
     return DatabaseResult_1((*target).rows);
+}
+
+/** Returns a cold exact-byte equality cursor over one admitted reflected Field. */
+DatabaseResult *Database_queryEqual(Database *self, const char *entityName,
+                                    const char *fieldName, const void *value,
+                                    size_t valueLength) {
+    if (self == nullptr || entityName == nullptr || fieldName == nullptr ||
+        value == nullptr || valueLength == 0u) {
+        recordError(self, DATABASE_INVALID, "queryEqual: null or empty argument");
+        THROW("Database_queryEqual: null or empty argument");
+        return nullptr;
+    }
+    int32_t entityIndex = Database_entityIndex(self, entityName);
+    if (entityIndex < 0) {
+        recordError(self, DATABASE_ABSENT, "queryEqual: no such entity");
+        THROW("Database_queryEqual: no such entity");
+        return nullptr;
+    }
+    DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities,
+                                                     (uint32_t) entityIndex);
+    if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr) {
+        recordError(self, DATABASE_ABSENT, "queryEqual: entity unavailable");
+        THROW("Database_queryEqual: entity unavailable");
+        return nullptr;
+    }
+    char foldedField[REFLECT_FIELD_NAME_BYTES];
+    if (!VariableSlot_foldName(fieldName, foldedField)) {
+        recordError(self, DATABASE_INVALID, "queryEqual: invalid field name");
+        THROW("Database_queryEqual: invalid field name");
+        return nullptr;
+    }
+    Field *matched = nullptr;
+    uint32_t fieldCount = Struct_count((*entity).schema);
+    for (uint32_t i = 0u; i < fieldCount; i++) {
+        Field *candidate = Struct_get((*entity).schema, i);
+        const char *candidateName = Field_getName(candidate);
+        char candidateFolded[REFLECT_FIELD_NAME_BYTES];
+        if (candidateName != nullptr &&
+            VariableSlot_foldName(candidateName, candidateFolded) &&
+            strcmp(candidateFolded, foldedField) == 0) {
+            if (matched != nullptr) {
+                recordError(self, DATABASE_INVALID, "queryEqual: ambiguous field name");
+                THROW("Database_queryEqual: ambiguous field name");
+                return nullptr;
+            }
+            matched = candidate;
+        }
+    }
+    if (matched == nullptr) {
+        recordError(self, DATABASE_ABSENT, "queryEqual: no such field");
+        THROW("Database_queryEqual: no such field");
+        return nullptr;
+    }
+    uint32_t rowSize = Struct_getSize((*entity).schema);
+    uint32_t offset = Field_getOffset(matched);
+    uint32_t fieldSize = Field_getSize(matched);
+    if (fieldSize == 0u || valueLength != fieldSize || offset > rowSize ||
+        fieldSize > rowSize - offset) {
+        recordError(self, DATABASE_INVALID, "queryEqual: field span or value size is invalid");
+        THROW("Database_queryEqual: field span or value size is invalid");
+        return nullptr;
+    }
+    ChunkedList *selected = ChunkedList_3(ID_DB_DATABASE_ROW,
+        (uint32_t) sizeof(void*), (*self).chunkBytes);
+    if (selected == nullptr) {
+        recordError(self, DATABASE_EXHAUSTED, "queryEqual: result allocation failed");
+        THROW("Database_queryEqual: result allocation failed");
+        return nullptr;
+    }
+    uint32_t rowCount = ChunkedList_size((*entity).rows);
+    for (uint32_t i = 0u; i < rowCount; i++) {
+        uint8_t *rowSlot = ChunkedList_slot((*entity).rows, i);
+        void *row = rowSlot == nullptr ? nullptr : *((void**) rowSlot);
+        if (row == nullptr) {
+            ChunkedList_free(selected);
+            recordError(self, DATABASE_CORRUPT, "queryEqual: null row slot");
+            THROW("Database_queryEqual: null row slot");
+            return nullptr;
+        }
+        if (memcmp((const uint8_t*) row + offset, value, fieldSize) == 0) {
+            uint8_t *selectedSlot = ChunkedList_addSlot(selected);
+            if (selectedSlot == nullptr) {
+                ChunkedList_free(selected);
+                recordError(self, DATABASE_EXHAUSTED, "queryEqual: result growth failed");
+                THROW("Database_queryEqual: result growth failed");
+                return nullptr;
+            }
+            *((void**) selectedSlot) = row;
+        }
+    }
+    DatabaseResult *result = DatabaseResult_2(selected, true);
+    if (result == nullptr) {
+        ChunkedList_free(selected);
+        recordError(self, DATABASE_EXHAUSTED, "queryEqual: cursor allocation failed");
+        THROW("Database_queryEqual: cursor allocation failed");
+        return nullptr;
+    }
+    recordError(self, DATABASE_OK, "");
+    return result;
 }
 
 // DIAGNOSTICS
