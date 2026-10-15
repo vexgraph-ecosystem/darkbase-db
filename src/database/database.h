@@ -102,11 +102,26 @@ DatabaseResult *Database_queryEqual(Database *self, const char *entity,
                                     size_t valueLength);
 // Inclusive signed int32 range query: the field bytes are interpreted as a
 // native int32_t regardless of reflected typeId. The field must have exactly
-// sizeof(int32_t) bytes within Struct.size. Result borrows matching rows; this
-// is a cold scan, not an index lookup.
+// sizeof(int32_t) bytes within Struct.size. Result borrows matching rows. Uses
+// the entity's declared int32 index when one covers this field (see
+// Database_indexBuild) and otherwise scans the row list; both return the same
+// matches, though the indexed path yields them in key order.
 DatabaseResult *Database_queryInt32Range(Database *self, const char *entity,
                                          const char *field, int32_t minimum,
                                          int32_t maximum);
+
+// --- In-memory integer index ---
+// Build the int32 index for one field of an entity: the Field must carry
+// REFLECT_FIELD_INDEXED and span exactly sizeof(int32_t) within Struct.size, so
+// the schema's flag is the opt-in declaration. Cold path. Rows are append-only,
+// so inserts only mark the records stale and the next query rebuilds them; while
+// an index exists the indexed field of a bound row must not be mutated in place,
+// which the Database does not detect. Records are in-memory only: nothing is
+// persisted, and a load drops them while the definition survives for the next
+// query. Returns a DATABASE_* code.
+int32_t Database_indexBuild(Database *self, const char *entity, const char *field);
+// True when the entity declares an index for that field (records may be stale).
+bool Database_indexed(const Database *self, const char *entity, const char *field);
 
 // --- Persistence (M2, .vexdb) ---
 // Serialize the registry and bound rows to a native-endian .vexdb file, or load

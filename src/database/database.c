@@ -70,6 +70,11 @@
  * PRIVATE HELPERS (kept file-local, pure logic):
  *   findEntity(self, folded)   // linear name lookup over the entity rows (static)
  *   recordError(self, code, message) // store the last result + text (static)
+ *   indexDrop(entity)          // release the index records (static)
+ *   indexInvalidate(entity)    // stale-mark after a row-list replacement (static)
+ *   indexAt/indexSwap/indexSiftDown/indexSort(records) // heapsort by key (static)
+ *   indexRebuild(self, entity) // rebuild the key-sorted records (static)
+ *   resolveField(entity, name) // resolve a field name to its span, by value (static)
  *
  * SLOT RECORD (owned by Database, behaviorless; all behavior hangs off Database):
  *   DbEntity {
@@ -78,8 +83,22 @@
  *     uint32_t pad;         // explicit padding
  *     Struct *schema;       // borrowed reflection layout (the entity)
  *     ChunkedList *rows;    // row pointers (void*); stable addresses
+ *     char indexField[24];  // folded indexed field name ("" = no index declared)
+ *     uint32_t indexOffset; // in-row byte offset of the indexed span
+ *     uint32_t indexDirty;  // 1 = the row list changed since the last rebuild
+ *     ChunkedList *indexRecords; // DbIndexRecord rows, key-sorted
  *   }
  * PRIVATE HELPER RECORD:
+ *   DbIndexRecord {
+ *     int32_t key;   // indexed int32 value admitted from the row bytes
+ *     uint32_t pad;  // explicit padding
+ *     void *row;     // borrowed bound row carrying that value
+ *   }
+ *   DbFieldSpan {
+ *     int32_t code;  // DATABASE_OK, or the rejection code
+ *     Field *field;  // borrowed matched Field (null unless code is DATABASE_OK)
+ *     uint32_t offset, size; // resolved in-row span of the requested field
+ *   }
  *   DbLoadStage {
  *     DbEntity *entity;       // target untouched entity during staged loading
  *     ChunkedList *rows;      // temporary complete owned-row list
@@ -114,7 +133,7 @@
  * Public Constructors: (.h) Database_0(), _1(chunkBytes), _init, _free
  * Public Core Functions: (.h) _kind, _check, _define, _entityIndex, _entityCount,
  *                             _schema, _insert, _insertOwned, _row, _count, _select,
- *                             _queryEqual, _queryInt32Range
+ *                             _queryEqual, _queryInt32Range, _indexBuild, _indexed
  * Public Persistence: (.h) _save, _load
  *                      _saveStore, _loadStore (caller-owned page Store)
  *   int32_t Database_saveStore(Database *self, Store *store)
@@ -143,8 +162,13 @@
  * equality. It allocates an owned pointer-list container, borrows matched rows,
  * and returns no numeric coercion, ordering, planner or persistent index.
  * queryInt32Range admits an exact int32_t byte span and interprets those bytes
- * as native int32_t values with inclusive signed comparisons. This operation
- * is not an index.
+ * as native int32_t values with inclusive signed comparisons. It uses the
+ * entity's declared int32 index when one covers the field and scans otherwise,
+ * returning the same matches either way (key order when indexed).
+ * indexBuild admits only a REFLECT_FIELD_INDEXED span of exactly int32_t width:
+ * the records are an in-memory key-sorted array of borrowed row pointers,
+ * refreshed after a row-list change and never persisted. The indexed field of a
+ * bound row must not be mutated in place while an index exists.
  * ============================================================================
  */
 
@@ -156,7 +180,27 @@ typedef struct DbEntity {
     uint32_t pad;                    // explicit padding
     Struct *schema;                  // borrowed reflection layout (the entity)
     ChunkedList *rows;               // row pointers (void*); stable addresses
+    char indexField[DB_ENTITY_NAME_BYTES]; // folded indexed field name ("" = none)
+    uint32_t indexOffset;            // in-row byte offset of the indexed span
+    uint32_t indexDirty;             // 1 = the row list changed since the rebuild
+    ChunkedList *indexRecords;       // DbIndexRecord rows, key-sorted
 } DbEntity;
+
+// PRIVATE HELPER RECORD (owned by Database; behaviorless)
+typedef struct DbIndexRecord {
+    int32_t key;   // indexed int32 value admitted from the row bytes
+    uint32_t pad;  // explicit padding
+    void *row;     // borrowed bound row carrying that value
+} DbIndexRecord;
+
+// PRIVATE HELPER RECORD (owned by Database; behaviorless) — the resolved span
+// of one requested field, returned by value (the Value Return Law).
+typedef struct DbFieldSpan {
+    int32_t code;  // DATABASE_OK, or the rejection code
+    Field *field;  // borrowed matched Field (null unless code is DATABASE_OK)
+    uint32_t offset;
+    uint32_t size;
+} DbFieldSpan;
 
 // PRIVATE HELPER RECORD
 typedef struct DbLoadStage {
@@ -199,6 +243,130 @@ static int32_t findEntity(const Database *self, const char *folded) {
             return (int32_t) i;
     }
     return -1;
+}
+
+// --- In-memory int32 index (cold path; the Data-Oriented Storage Law) ---
+// The index is a key-sorted array of borrowed row pointers layered over the
+// entity's row list. Rows are append-only, so a row-list change only ever needs
+// a refresh: inserts mark the records stale and the next query rebuilds them,
+// which keeps the admission path allocation-free and free of partial state.
+
+/** Release an entity's index records, leaving no index behind. */
+static void indexDrop(DbEntity *entity) {
+    if (entity == nullptr || (*entity).indexRecords == nullptr)
+        return;
+    ChunkedList_free((*entity).indexRecords);
+    (*entity).indexRecords = nullptr;
+}
+
+/** Invalidate the records after the row list changed, keeping the definition. */
+static void indexInvalidate(DbEntity *entity) {
+    if (entity == nullptr || (*entity).indexField[0] == '\0')
+        return;
+    indexDrop(entity);
+    (*entity).indexDirty = 1u;
+}
+
+/** Borrow one record (slot(i) resolves for every i below the list's size). */
+static DbIndexRecord *indexAt(ChunkedList *records, uint32_t index) {
+    return (DbIndexRecord*) ChunkedList_slot(records, index);
+}
+
+/** Exchange two index records in place. */
+static void indexSwap(ChunkedList *records, uint32_t a, uint32_t b) {
+    DbIndexRecord *ra = indexAt(records, a);
+    DbIndexRecord *rb = indexAt(records, b);
+    DbIndexRecord kept = *ra;
+    *ra = *rb;
+    *rb = kept;
+}
+
+/** Restore the max-heap property below root: heapsort's only primitive. */
+static void indexSiftDown(ChunkedList *records, uint32_t root, uint32_t count) {
+    while (root * 2u + 1u < count) {
+        uint32_t child = root * 2u + 1u;
+        if (child + 1u < count &&
+            (*indexAt(records, child + 1u)).key > (*indexAt(records, child)).key)
+            child++;
+        if ((*indexAt(records, root)).key >= (*indexAt(records, child)).key)
+            return;
+        indexSwap(records, root, child);
+        root = child;
+    }
+}
+
+/** Heapsort the records by key: O(n log n), one list, no extra allocation. */
+static void indexSort(ChunkedList *records) {
+    uint32_t count = ChunkedList_size(records);
+    for (uint32_t start = count / 2u; start > 0u; start--)
+        indexSiftDown(records, start - 1u, count);
+    for (uint32_t end = count - 1u; end > 0u; end--) {
+        indexSwap(records, 0u, end);
+        indexSiftDown(records, 0u, end);
+    }
+}
+
+/** Rebuild the key-sorted records from the live row list (cold path only). */
+static bool indexRebuild(Database *self, DbEntity *entity) {
+    indexDrop(entity);
+    uint32_t count = ChunkedList_size((*entity).rows);
+    ChunkedList *records = ChunkedList_3(ID_DB_DATABASE_ROW,
+        (uint32_t) sizeof(DbIndexRecord), (*self).chunkBytes);
+    if (records == nullptr)
+        return false;
+    for (uint32_t i = 0u; i < count; i++) {
+        uint8_t *rowSlot = ChunkedList_slot((*entity).rows, i);
+        void *row = rowSlot == nullptr ? nullptr : *((void**) rowSlot);
+        uint8_t *slot = row == nullptr ? nullptr : ChunkedList_addSlot(records);
+        if (slot == nullptr) {
+            ChunkedList_free(records);
+            return false;
+        }
+        DbIndexRecord *record = (DbIndexRecord*) slot;
+        int32_t key = 0;
+        memcpy(&key, (const uint8_t*) row + (*entity).indexOffset, sizeof(key));
+        (*record).key = key;
+        (*record).row = row;
+    }
+    indexSort(records);
+    (*entity).indexRecords = records;
+    (*entity).indexDirty = 0u;
+    return true;
+}
+
+/** Resolve one requested field name to its span within the entity's schema. */
+static DbFieldSpan resolveField(DbEntity *entity, const char *fieldName) {
+    DbFieldSpan span = { DATABASE_ABSENT, nullptr, 0u, 0u };
+    if (entity == nullptr || (*entity).schema == nullptr)
+        return span;
+    char folded[REFLECT_FIELD_NAME_BYTES];
+    if (fieldName == nullptr || !VariableSlot_foldName(fieldName, folded)) {
+        span.code = DATABASE_INVALID;
+        return span;
+    }
+    Field *matched = nullptr;
+    uint32_t fieldCount = Struct_count((*entity).schema);
+    for (uint32_t i = 0u; i < fieldCount; i++) {
+        Field *candidate = Struct_get((*entity).schema, i);
+        const char *candidateName = Field_getName(candidate);
+        char candidateFolded[REFLECT_FIELD_NAME_BYTES];
+        if (candidateName != nullptr &&
+            VariableSlot_foldName(candidateName, candidateFolded) &&
+            strcmp(candidateFolded, folded) == 0) {
+            if (matched != nullptr) {
+                span.code = DATABASE_INVALID; // ambiguous
+                return span;
+            }
+            matched = candidate;
+        }
+    }
+    if (matched == nullptr)
+        return span; // ABSENT
+    span.code = DATABASE_OK;
+    span.field = matched;
+    span.offset = Field_getOffset(matched);
+    span.size = Field_getSize(matched);
+    return span;
 }
 
 // CONSTRUCTORS
@@ -266,6 +434,7 @@ void Database_free(Database *self) {
                         Memory_free(*(void**) slot);
                 }
             }
+            indexDrop(entity);
             ChunkedList_free((*entity).rows);
         }
         ChunkedList_free((*self).entities);
@@ -336,6 +505,10 @@ int32_t Database_define(Database *self, Struct *schema) {
         THROW("Database_define: row list allocation failed");
         return -1;
     }
+    (*entity).indexField[0] = '\0';
+    (*entity).indexOffset = 0u;
+    (*entity).indexDirty = 0u;
+    (*entity).indexRecords = nullptr;
     recordError(self, DATABASE_OK, "");
     return (int32_t) (ChunkedList_size((*self).entities) - 1u);
 }
@@ -415,6 +588,7 @@ int32_t Database_insert(Database *self, const char *entity, void *row) {
         return -1;
     }
     *((void**) slot) = row;
+    (*target).indexDirty = 1u;
     recordError(self, DATABASE_OK, "");
     return (int32_t) (ChunkedList_size((*target).rows) - 1u);
 }
@@ -477,6 +651,7 @@ int32_t Database_insertOwned(Database *self, const char *entity, const void *row
     }
     *((void**) slot) = copy;
     (*target).owned = 1u;
+    (*target).indexDirty = 1u;
     recordError(self, DATABASE_OK, "");
     return (int32_t) (ChunkedList_size((*target).rows) - 1u);
 }
@@ -694,19 +869,28 @@ DatabaseResult *Database_queryInt32Range(Database *self, const char *entityName,
         THROW("Database_queryInt32Range: result allocation failed");
         return nullptr;
     }
-    uint32_t rowCount = ChunkedList_size((*entity).rows);
-    for (uint32_t i = 0u; i < rowCount; i++) {
-        uint8_t *rowSlot = ChunkedList_slot((*entity).rows, i);
-        void *row = rowSlot == nullptr ? nullptr : *((void**) rowSlot);
-        if (row == nullptr) {
-            ChunkedList_free(selected);
-            recordError(self, DATABASE_CORRUPT, "queryInt32Range: null row slot");
-            THROW("Database_queryInt32Range: null row slot");
-            return nullptr;
+    // Prefer the declared int32 index when one covers this exact field; the scan
+    // below stays the fallback, and both paths must return the same matches.
+    bool indexed = (*entity).indexRecords != nullptr &&
+        (*entity).indexField[0] != '\0' &&
+        strcmp((*entity).indexField, foldedField) == 0;
+    if (indexed && (*entity).indexDirty != 0u)
+        indexed = indexRebuild(self, entity);
+    if (indexed) {
+        uint32_t records = ChunkedList_size((*entity).indexRecords);
+        uint32_t low = 0u;
+        uint32_t high = records;
+        while (low < high) { // first record whose key is >= minimum
+            uint32_t mid = low + (high - low) / 2u;
+            if ((*indexAt((*entity).indexRecords, mid)).key < minimum)
+                low = mid + 1u;
+            else
+                high = mid;
         }
-        int32_t value = 0;
-        memcpy(&value, (const uint8_t*) row + offset, sizeof(value));
-        if (value >= minimum && value <= maximum) {
+        for (uint32_t i = low; i < records; i++) {
+            DbIndexRecord *record = indexAt((*entity).indexRecords, i);
+            if ((*record).key > maximum)
+                break;
             uint8_t *selectedSlot = ChunkedList_addSlot(selected);
             if (selectedSlot == nullptr) {
                 ChunkedList_free(selected);
@@ -714,7 +898,31 @@ DatabaseResult *Database_queryInt32Range(Database *self, const char *entityName,
                 THROW("Database_queryInt32Range: result growth failed");
                 return nullptr;
             }
-            *((void**) selectedSlot) = row;
+            *((void**) selectedSlot) = (*record).row;
+        }
+    } else {
+        uint32_t rowCount = ChunkedList_size((*entity).rows);
+        for (uint32_t i = 0u; i < rowCount; i++) {
+            uint8_t *rowSlot = ChunkedList_slot((*entity).rows, i);
+            void *row = rowSlot == nullptr ? nullptr : *((void**) rowSlot);
+            if (row == nullptr) {
+                ChunkedList_free(selected);
+                recordError(self, DATABASE_CORRUPT, "queryInt32Range: null row slot");
+                THROW("Database_queryInt32Range: null row slot");
+                return nullptr;
+            }
+            int32_t value = 0;
+            memcpy(&value, (const uint8_t*) row + offset, sizeof(value));
+            if (value >= minimum && value <= maximum) {
+                uint8_t *selectedSlot = ChunkedList_addSlot(selected);
+                if (selectedSlot == nullptr) {
+                    ChunkedList_free(selected);
+                    recordError(self, DATABASE_EXHAUSTED, "queryInt32Range: result growth failed");
+                    THROW("Database_queryInt32Range: result growth failed");
+                    return nullptr;
+                }
+                *((void**) selectedSlot) = row;
+            }
         }
     }
     DatabaseResult *result = DatabaseResult_2(selected, true);
@@ -726,6 +934,89 @@ DatabaseResult *Database_queryInt32Range(Database *self, const char *entityName,
     }
     recordError(self, DATABASE_OK, "");
     return result;
+}
+
+// IN-MEMORY INTEGER INDEX
+
+/**
+ * Declares and builds the int32 index for one field of an entity. The Field must
+ * carry REFLECT_FIELD_INDEXED and span exactly sizeof(int32_t) inside the row
+ * stride, so the index is opt-in per field per entity and the schema stays the
+ * single declaration point. Cold path. The definition outlives a row-list
+ * replacement (a load drops the records and the next query rebuilds them).
+ */
+int32_t Database_indexBuild(Database *self, const char *entityName, const char *fieldName) {
+    if (self == nullptr || entityName == nullptr || fieldName == nullptr) {
+        recordError(self, DATABASE_INVALID, "indexBuild: null or empty argument");
+        THROW("Database_indexBuild: null or empty argument");
+        return DATABASE_INVALID;
+    }
+    char foldedEntity[DB_ENTITY_NAME_BYTES];
+    char foldedField[REFLECT_FIELD_NAME_BYTES];
+    if (!VariableSlot_foldName(entityName, foldedEntity) ||
+        !VariableSlot_foldName(fieldName, foldedField)) {
+        recordError(self, DATABASE_INVALID, "indexBuild: invalid or unknown field");
+        THROW("Database_indexBuild: invalid or unknown field");
+        return DATABASE_INVALID;
+    }
+    int32_t entityIndex = findEntity(self, foldedEntity);
+    if (entityIndex < 0) {
+        recordError(self, DATABASE_ABSENT, "indexBuild: no such entity");
+        THROW("Database_indexBuild: no such entity");
+        return DATABASE_ABSENT;
+    }
+    DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, (uint32_t) entityIndex);
+    if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr) {
+        recordError(self, DATABASE_ABSENT, "indexBuild: no such entity");
+        THROW("Database_indexBuild: no such entity");
+        return DATABASE_ABSENT;
+    }
+    DbFieldSpan span = resolveField(entity, fieldName);
+    if (span.code != DATABASE_OK) {
+        recordError(self, span.code, "indexBuild: invalid or unknown field");
+        THROW("Database_indexBuild: invalid or unknown field");
+        return span.code;
+    }
+    uint32_t rowSize = Struct_getSize((*entity).schema);
+    if (!Field_isIndexed(span.field) || span.size != sizeof(int32_t) ||
+        span.offset > rowSize || span.size > rowSize - span.offset) {
+        recordError(self, DATABASE_INVALID, "indexBuild: field is not a declared int32 index");
+        THROW("Database_indexBuild: field is not a declared int32 index");
+        return DATABASE_INVALID;
+    }
+    memcpy((*entity).indexField, foldedField, strlen(foldedField) + 1u);
+    (*entity).indexOffset = span.offset;
+    (*entity).indexDirty = 1u;
+    if (!indexRebuild(self, entity)) {
+        (*entity).indexField[0] = '\0'; // no half-declared index survives
+        recordError(self, DATABASE_EXHAUSTED, "indexBuild: index allocation failed");
+        THROW("Database_indexBuild: index allocation failed");
+        return DATABASE_EXHAUSTED;
+    }
+    recordError(self, DATABASE_OK, "");
+    return DATABASE_OK;
+}
+
+/**
+ * Reports whether an entity declares an index for that field. This is the
+ * declaration, not the records: after a load the records are dropped and the
+ * next query rebuilds them, so the answer stays true meanwhile.
+ */
+bool Database_indexed(const Database *self, const char *entityName, const char *fieldName) {
+    if (self == nullptr || entityName == nullptr || fieldName == nullptr)
+        return false;
+    char foldedEntity[DB_ENTITY_NAME_BYTES];
+    char foldedField[REFLECT_FIELD_NAME_BYTES];
+    if (!VariableSlot_foldName(entityName, foldedEntity) ||
+        !VariableSlot_foldName(fieldName, foldedField))
+        return false;
+    int32_t entityIndex = findEntity(self, foldedEntity);
+    if (entityIndex < 0)
+        return false;
+    DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, (uint32_t) entityIndex);
+    if (entity == nullptr || (*entity).indexField[0] == '\0')
+        return false;
+    return strcmp((*entity).indexField, foldedField) == 0;
 }
 
 // DIAGNOSTICS
@@ -1027,6 +1318,7 @@ static int32_t loadCommit(Database *self, const uint8_t *payload, size_t length,
             (*entity).owned = 1u;
             stages[i].rows = nullptr;
             ChunkedList_free(oldRows);
+            indexInvalidate(entity); // the row list changed; the next query rebuilds
         }
     }
     for (uint32_t i = 0u; i < staged; i++)
@@ -1409,6 +1701,7 @@ static int32_t databaseStoreLoadCommit(Database *self, const uint8_t *bytes,
             (*entity).owned = 1u;
             stages[i].rows = nullptr;
             ChunkedList_free(oldRows);
+            indexInvalidate(entity); // the row list changed; the next query rebuilds
         }
     }
     for (uint32_t i = 0u; i < staged; i++)
