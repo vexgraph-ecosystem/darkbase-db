@@ -16,6 +16,7 @@
 #include "oop/type.h"
 #include "reflection/struct.h"
 #include "relational/variable_slot.h"
+#include "store/store.h"
 
 ;;DEFINITION
 /**
@@ -80,16 +81,28 @@
  *   }
  * PRIVATE HELPER RECORD:
  *   DbLoadStage {
- *     DbEntity *entity;    // target untouched entity during staged loading
- *     ChunkedList *rows;   // temporary complete owned-row list
+ *     DbEntity *entity;       // target untouched entity during staged loading
+ *     ChunkedList *rows;      // temporary complete owned-row list
+ *   }
+ *   DatabaseStoreRoot {
+ *     char magic[8]; uint32_t version, firstPage; uint64_t length;
+ *     uint32_t crc, reserved; // snapshot publication root, 32 Bytes
+ *   }
+ *   DatabaseStoreLink {
+ *     uint32_t nextPage, chunkBytes; uint64_t offset;
+ *     // linked data chunk; offsets must be contiguous while loading
  *   }
  *
  * PRIVATE HELPERS (persistence, pure logic):
  *   writeAll(file, src, length)             // short-write-safe (static)
  *   readAll(file, dest, length)             // short-read-safe (static)
+ *   syncFile(file)                          // sync mapped file data (static)
  *   loadPayload(self, bytes, len, count)         // validate snapshot records (static)
  *   loadCommit(self, bytes, len, count)          // stage rows then publish atomically (static)
  *   freeOwnedRows(rows)                          // free staged owned copies (static)
+ *   databaseSnapshotBytes(self, outLength)       // serialize M2 payload to owned bytes (static)
+ *   databaseStoreReadRoot(store, pageBytes, outRoot) // validate root page (static)
+ *   databaseStoreEnsureRoot(store)               // seed/validate page id 1 (static)
  *
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
@@ -97,12 +110,20 @@
  * Public Core Functions: (.h) _kind, _check, _define, _entityIndex, _entityCount,
  *                             _schema, _insert, _insertOwned, _row, _count, _select
  * Public Persistence: (.h) _save, _load
+ *                      _saveStore, _loadStore (caller-owned page Store)
+ *   int32_t Database_saveStore(Database *self, Store *store)
+ *   int32_t Database_loadStore(Database *self, Store *store)
  * Public Diagnostics: (.h) _errorCode, _lastError, _errorText
  * Public String Projections: (.h) _toString / _toStringStruct
  * CONTRACT: schemas and borrowed rows outlive Database; owned rows are copied
  * at exact Struct.size and freed once by Database_free. An entity cannot mix
  * ownership modes. Load stages all owned rows before publishing any entity;
  * rejection preserves every target row list and ownership flag.
+ * Page-store snapshot publication is one root-page write after all chained data
+ * pages commit. This v1 bridge is owner-affine and retains old pages; it is not
+ * multi-page transactions, indexing, or journal recycling. A failed data-chain
+ * write leaves the prior root intact; uncertain root-commit failure requires
+ * Store close/reopen before further use.
  * ============================================================================
  */
 
@@ -263,7 +284,7 @@ int32_t Database_define(Database *self, Struct *schema) {
         return -1;
     }
     char name[DB_ENTITY_NAME_BYTES];
-    if (Struct_getName(schema, name, sizeof(name)) < 0) {
+    if (Struct_getName(name, sizeof(name), schema) < 0) {
         recordError(self, DATABASE_INVALID, "define: schema has no valid name");
         THROW("Database_define: schema has no valid name");
         return -1;
@@ -520,6 +541,8 @@ const char *Database_errorText(int32_t code) {
         case DATABASE_DUPLICATE: return "duplicate entity";
         case DATABASE_ABSENT:    return "absent entity";
         case DATABASE_EXHAUSTED: return "allocation exhausted";
+        case DATABASE_IO:        return "durable store IO failure";
+        case DATABASE_CORRUPT:   return "durable store data rejected";
         default:                 return "unknown";
     }
 }
@@ -560,6 +583,29 @@ typedef struct VexDbEntity {
     uint32_t rowCount;               // rows that follow
 } VexDbEntity;
 _Static_assert(sizeof(VexDbEntity) == 32u, "VexDbEntity must stay 32 Bytes");
+
+// DatabaseStoreRoot is the single-page publication point for a page-chain
+// snapshot. Data pages are durable before this record is replaced.
+typedef struct DatabaseStoreRoot {
+    char magic[8];
+    uint32_t version;
+    uint32_t firstPage;
+    uint64_t length;
+    uint32_t crc;
+    uint32_t reserved;
+} DatabaseStoreRoot;
+_Static_assert(sizeof(DatabaseStoreRoot) == 32u, "DatabaseStoreRoot must stay 32 Bytes");
+
+typedef struct DatabaseStoreLink {
+    uint32_t nextPage;
+    uint32_t chunkBytes;
+    uint64_t offset;
+} DatabaseStoreLink;
+_Static_assert(sizeof(DatabaseStoreLink) == 16u, "DatabaseStoreLink must stay 16 Bytes");
+
+#define DATABASE_STORE_ROOT_ID 1u
+#define DATABASE_STORE_VERSION 1u
+#define DATABASE_STORE_ROOT_MAGIC "DBROOT01"
 
 /**
  * Writes the full byte span, retrying short writes; returns false on a
@@ -916,6 +962,281 @@ int32_t Database_load(Database *self, const char *path) {
     if (status != DATABASE_OK) {
         recordError(self, status, "load: payload rejected");
         THROW("Database_load: payload rejected");
+        return status;
+    }
+    recordError(self, DATABASE_OK, "");
+    return DATABASE_OK;
+}
+
+/** Serializes the current schemas and rows into the established M2 byte payload. */
+static uint8_t *databaseSnapshotBytes(Database *self, size_t *outLength) {
+    if (outLength != nullptr)
+        *outLength = 0u;
+    uint32_t entityCount = Database_entityCount(self);
+    size_t length = sizeof(VexDbHeader) + VEX_DB_TRAILER_BYTES;
+    uint64_t rowTotal = 0u;
+    for (uint32_t e = 0u; e < entityCount; e++) {
+        DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, e);
+        if (entity == nullptr || (*entity).schema == nullptr || (*entity).rows == nullptr)
+            return nullptr;
+        uint32_t stride = Struct_getSize((*entity).schema);
+        uint32_t count = ChunkedList_size((*entity).rows);
+        if (stride == 0u || (size_t) count > (SIZE_MAX - sizeof(VexDbEntity)) / stride)
+            return nullptr;
+        size_t rowBytes = (size_t) count * stride;
+        if (length > SIZE_MAX - sizeof(VexDbEntity) - rowBytes)
+            return nullptr;
+        length += sizeof(VexDbEntity) + rowBytes;
+        rowTotal += count;
+    }
+    uint8_t *bytes = (uint8_t*) Memory_alloc(0u, length);
+    if (bytes == nullptr)
+        return nullptr;
+    VexDbHeader header;
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, VEX_DB_MAGIC, 7u);
+    header.version = VEX_DB_VERSION;
+    header.entityCount = entityCount;
+    header.rowCount = rowTotal;
+    memcpy(bytes, &header, sizeof(header));
+    size_t offset = sizeof(header);
+    for (uint32_t e = 0u; e < entityCount; e++) {
+        DbEntity *entity = (DbEntity*) ChunkedList_slot((*self).entities, e);
+        uint32_t stride = Struct_getSize((*entity).schema);
+        uint32_t count = ChunkedList_size((*entity).rows);
+        VexDbEntity record;
+        memset(&record, 0, sizeof(record));
+        memcpy(record.name, (*entity).name, sizeof(record.name));
+        record.stride = stride;
+        record.rowCount = count;
+        memcpy(bytes + offset, &record, sizeof(record));
+        offset += sizeof(record);
+        for (uint32_t r = 0u; r < count; r++) {
+            uint8_t *slot = ChunkedList_slot((*entity).rows, r);
+            void *row = slot == nullptr ? nullptr : *((void**) slot);
+            if (row == nullptr) {
+                Memory_free(bytes);
+                return nullptr;
+            }
+            memcpy(bytes + offset, row, stride);
+            offset += stride;
+        }
+    }
+    uint32_t crc = Crc32_finalize(Crc32_update(CRC32_SEED, bytes + sizeof(header),
+                                               offset - sizeof(header)));
+    memcpy(bytes + offset, &crc, sizeof(crc));
+    if (outLength != nullptr)
+        *outLength = length;
+    return bytes;
+}
+
+/** Reads and validates the fixed catalog publication point. */
+static bool databaseStoreReadRoot(Store *store, uint8_t *pageBytes,
+                                  DatabaseStoreRoot *outRoot) {
+    uint32_t length = 0u;
+    uint32_t kind = 0u;
+    bool truncated = false;
+    StoreCode code = Store_page_read(store, DATABASE_STORE_ROOT_ID, pageBytes,
+        Store_pageSize(store), &length, &kind, &truncated);
+    if (code != STORE_OK || truncated || kind != PAGE_KIND_CATALOG ||
+        length != sizeof(*outRoot))
+        return false;
+    memcpy(outRoot, pageBytes, sizeof(*outRoot));
+    return memcmp((*outRoot).magic, DATABASE_STORE_ROOT_MAGIC, 8u) == 0 &&
+        (*outRoot).version == DATABASE_STORE_VERSION && (*outRoot).reserved == 0u;
+}
+
+/** Ensures a fresh Store has the fixed, empty root page at logical page id one. */
+static bool databaseStoreEnsureRoot(Store *store) {
+    if (Store_pageCount(store) != 0u) {
+        uint32_t pageSize = Store_pageSize(store);
+        uint8_t *pageBytes = (uint8_t*) Memory_alloc(0u, pageSize);
+        if (pageBytes == nullptr)
+            return false;
+        DatabaseStoreRoot existing;
+        bool valid = databaseStoreReadRoot(store, pageBytes, &existing);
+        Memory_free(pageBytes);
+        return valid;
+    }
+    DatabaseStoreRoot root;
+    memset(&root, 0, sizeof(root));
+    memcpy(root.magic, DATABASE_STORE_ROOT_MAGIC, 8u);
+    root.version = DATABASE_STORE_VERSION;
+    uint32_t pageId = 0u;
+    return Store_add(store, PAGE_KIND_CATALOG, (const uint8_t*) &root,
+                     (uint32_t) sizeof(root), &pageId) == STORE_OK &&
+        pageId == DATABASE_STORE_ROOT_ID;
+}
+
+/** Publishes page-chain bytes, then atomically replaces the root page. */
+int32_t Database_saveStore(Database *self, Store *store) {
+    if (self == nullptr || store == nullptr || !Store_isOpen(store)) {
+        recordError(self, DATABASE_INVALID, "saveStore: invalid database or closed store");
+        THROW("Database_saveStore: invalid database or closed store");
+        return DATABASE_INVALID;
+    }
+    if (!databaseStoreEnsureRoot(store)) {
+        recordError(self, DATABASE_IO, "saveStore: root page admission failed");
+        THROW("Database_saveStore: root page admission failed");
+        return DATABASE_IO;
+    }
+    size_t length = 0u;
+    uint8_t *bytes = databaseSnapshotBytes(self, &length);
+    if (bytes == nullptr) {
+        recordError(self, DATABASE_EXHAUSTED, "saveStore: snapshot serialization failed");
+        THROW("Database_saveStore: snapshot serialization failed");
+        return DATABASE_EXHAUSTED;
+    }
+    uint32_t pageSize = Store_pageSize(store);
+    size_t chunkCapacity = (size_t) pageSize - PAGE_HEADER_BYTES - sizeof(DatabaseStoreLink);
+    uint32_t nextPage = 0u;
+    size_t end = length;
+    bool ok = chunkCapacity > 0u;
+    while (ok && end > 0u) {
+        size_t start = end > chunkCapacity ? end - chunkCapacity : 0u;
+        uint32_t chunkBytes = (uint32_t) (end - start);
+        size_t payloadLength = sizeof(DatabaseStoreLink) + chunkBytes;
+        uint8_t *payload = (uint8_t*) Memory_alloc(0u, payloadLength);
+        if (payload == nullptr) {
+            ok = false;
+            break;
+        }
+        DatabaseStoreLink link = { nextPage, chunkBytes, start };
+        memcpy(payload, &link, sizeof(link));
+        memcpy(payload + sizeof(link), bytes + start, chunkBytes);
+        uint32_t pageId = 0u;
+        StoreCode added = Store_add(store, PAGE_KIND_LEAF, payload,
+                                    (uint32_t) payloadLength, &pageId);
+        Memory_free(payload);
+        if (added != STORE_OK) {
+            ok = false;
+            break;
+        }
+        nextPage = pageId;
+        end = start;
+    }
+    if (!ok) {
+        Memory_free(bytes);
+        recordError(self, DATABASE_IO, "saveStore: data-page write failed before publication");
+        THROW("Database_saveStore: data-page write failed before publication");
+        return DATABASE_IO;
+    }
+    DatabaseStoreRoot root;
+    memset(&root, 0, sizeof(root));
+    memcpy(root.magic, DATABASE_STORE_ROOT_MAGIC, 8u);
+    root.version = DATABASE_STORE_VERSION;
+    root.firstPage = nextPage;
+    root.length = length;
+    root.crc = Crc32_finalize(Crc32_update(CRC32_SEED, bytes, length));
+    bool published = Store_page_write(store, DATABASE_STORE_ROOT_ID, PAGE_KIND_CATALOG,
+        (const uint8_t*) &root, (uint32_t) sizeof(root)) == STORE_OK;
+    Memory_free(bytes);
+    if (!published) {
+        recordError(self, DATABASE_IO, "saveStore: root publication failed; reopen to resolve");
+        THROW("Database_saveStore: root publication failed; reopen to resolve");
+        return DATABASE_IO;
+    }
+    recordError(self, DATABASE_OK, "");
+    return DATABASE_OK;
+}
+
+/** Loads the root-selected page chain, validates bytes, then stages rows atomically. */
+int32_t Database_loadStore(Database *self, Store *store) {
+    if (self == nullptr || store == nullptr || !Store_isOpen(store)) {
+        recordError(self, DATABASE_INVALID, "loadStore: invalid database or closed store");
+        THROW("Database_loadStore: invalid database or closed store");
+        return DATABASE_INVALID;
+    }
+    uint32_t pageSize = Store_pageSize(store);
+    uint8_t *pageBytes = (uint8_t*) Memory_alloc(0u, pageSize);
+    if (pageBytes == nullptr) {
+        recordError(self, DATABASE_EXHAUSTED, "loadStore: page buffer allocation failed");
+        THROW("Database_loadStore: page buffer allocation failed");
+        return DATABASE_EXHAUSTED;
+    }
+    DatabaseStoreRoot root;
+    bool rootOk = databaseStoreReadRoot(store, pageBytes, &root);
+    if (!rootOk || root.length == 0u || (uint64_t) (size_t) root.length != root.length ||
+        root.length > (uint64_t) Store_reserved(store)) {
+        Memory_free(pageBytes);
+        recordError(self, DATABASE_CORRUPT, "loadStore: root page is absent or invalid");
+        THROW("Database_loadStore: root page is absent or invalid");
+        return DATABASE_CORRUPT;
+    }
+    size_t length = (size_t) root.length;
+    uint8_t *bytes = (uint8_t*) Memory_alloc(0u, length);
+    if (bytes == nullptr) {
+        Memory_free(pageBytes);
+        recordError(self, DATABASE_EXHAUSTED, "loadStore: snapshot buffer allocation failed");
+        THROW("Database_loadStore: snapshot buffer allocation failed");
+        return DATABASE_EXHAUSTED;
+    }
+    size_t offset = 0u;
+    uint32_t pageId = root.firstPage;
+    uint32_t visited = 0u;
+    bool valid = pageId != 0u;
+    while (valid && offset < length) {
+        if (pageId == 0u || pageId > Store_pageCount(store) ||
+            visited++ >= Store_pageCount(store)) {
+            valid = false;
+            break;
+        }
+        uint32_t used = 0u;
+        uint32_t kind = 0u;
+        bool truncated = false;
+        StoreCode readCode = Store_page_read(store, pageId, pageBytes, pageSize,
+            &used, &kind, &truncated);
+        if (readCode != STORE_OK || truncated || kind != PAGE_KIND_LEAF ||
+            used < sizeof(DatabaseStoreLink)) {
+            valid = false;
+            break;
+        }
+        DatabaseStoreLink link;
+        memcpy(&link, pageBytes, sizeof(link));
+        if (link.offset != offset || link.chunkBytes != used - sizeof(link) ||
+            link.chunkBytes == 0u || link.chunkBytes > length - offset) {
+            valid = false;
+            break;
+        }
+        memcpy(bytes + offset, pageBytes + sizeof(link), link.chunkBytes);
+        offset += link.chunkBytes;
+        pageId = link.nextPage;
+    }
+    valid = valid && offset == length && pageId == 0u &&
+        Crc32_finalize(Crc32_update(CRC32_SEED, bytes, length)) == root.crc;
+    Memory_free(pageBytes);
+    if (!valid) {
+        Memory_free(bytes);
+        recordError(self, DATABASE_CORRUPT, "loadStore: page chain or snapshot checksum rejected");
+        THROW("Database_loadStore: page chain or snapshot checksum rejected");
+        return DATABASE_CORRUPT;
+    }
+    VexDbHeader header;
+    if (length < sizeof(header) + VEX_DB_TRAILER_BYTES) {
+        Memory_free(bytes);
+        recordError(self, DATABASE_CORRUPT, "loadStore: snapshot header truncated");
+        THROW("Database_loadStore: snapshot header truncated");
+        return DATABASE_CORRUPT;
+    }
+    memcpy(&header, bytes, sizeof(header));
+    uint32_t storedCrc = 0u;
+    memcpy(&storedCrc, bytes + length - sizeof(storedCrc), sizeof(storedCrc));
+    uint32_t actualCrc = Crc32_finalize(Crc32_update(CRC32_SEED,
+        bytes + sizeof(header), length - sizeof(header) - sizeof(storedCrc)));
+    int32_t status = DATABASE_INVALID;
+    if (memcmp(header.magic, VEX_DB_MAGIC, 7u) == 0 &&
+        header.version == VEX_DB_VERSION && storedCrc == actualCrc) {
+        size_t payloadLength = length - sizeof(header) - sizeof(storedCrc);
+        status = loadPayload(self, bytes + sizeof(header), payloadLength,
+                             header.entityCount);
+        if (status == DATABASE_OK)
+            status = loadCommit(self, bytes + sizeof(header), payloadLength,
+                                header.entityCount);
+    }
+    Memory_free(bytes);
+    if (status != DATABASE_OK) {
+        recordError(self, status, "loadStore: registered schemas rejected snapshot");
+        THROW("Database_loadStore: registered schemas rejected snapshot");
         return status;
     }
     recordError(self, DATABASE_OK, "");

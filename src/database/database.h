@@ -44,7 +44,11 @@ typedef enum DatabaseCode {
     DATABASE_DUPLICATE = 2, // an entity with the name is already registered
     DATABASE_ABSENT = 3,    // no such entity / row
     DATABASE_EXHAUSTED = 4, // row-list allocation failed
+    DATABASE_IO = 5,        // durable page-store operation failed
+    DATABASE_CORRUPT = 6,   // durable catalog/page stream rejected
 } DatabaseCode;
+
+typedef struct Store Store;
 
 typedef struct Database {
     ChunkedList *entities;              // DbEntity rows (layout private to database.c)
@@ -99,6 +103,13 @@ DatabaseResult *Database_select(Database *self, const char *entity);
 // scope for this slice.
 int32_t Database_save(Database *self, const char *path);
 int32_t Database_load(Database *self, const char *path);
+// Page-store persistence is a separate v1 path; it does not replace the legacy
+// flat snapshot API. Caller owns Store and supplies the same reflected schemas
+// before load. Each complete database image is published by one root-page write;
+// a failed pre-publication save leaves the prior image readable. Rows and schema
+// metadata are copied into page-owned bytes; live Database rows are unchanged.
+int32_t Database_saveStore(Database *self, Store *store);
+int32_t Database_loadStore(Database *self, Store *store);
 
 // --- Diagnostics ---
 int32_t Database_errorCode(const Database *self);
