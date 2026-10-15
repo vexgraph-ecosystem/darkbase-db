@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "c23/constructor.h"
+#include "database/database_catalog_entry.h"
 #include "database/database_result.h"
 #include "reflection/struct.h"
 #include "struct/chunked_list.h"
@@ -34,7 +35,6 @@
 // rows and every schema must outlive the Database; owned row copies do not.
 
 #define DB_ENTITY_NAME_MAX 23u
-#define DB_ENTITY_NAME_BYTES 24u
 #define DB_ERROR_MESSAGE_MAX 128u
 
 // Cold rejection codes (Database_errorCode). DATABASE_OK is success.
@@ -117,6 +117,10 @@ int32_t Database_load(Database *self, const char *path);
 // metadata are copied into page-owned bytes; live Database rows are unchanged.
 int32_t Database_saveStore(Database *self, Store *store);
 int32_t Database_loadStore(Database *self, Store *store);
+// Read one committed catalog record by zero-based position. The returned value
+// owns no storage and remains valid independently of Store lifetime. Invalid or
+// corrupt catalogs return a non-OK code; out-of-range indices report ABSENT.
+DatabaseCatalogEntry Database_storeCatalogEntry(Store *store, uint32_t index);
 
 // --- Diagnostics ---
 int32_t Database_errorCode(const Database *self);

@@ -119,9 +119,13 @@
  *                      _saveStore, _loadStore (caller-owned page Store)
  *   int32_t Database_saveStore(Database *self, Store *store)
  *   int32_t Database_loadStore(Database *self, Store *store)
+ *   DatabaseCatalogEntry Database_storeCatalogEntry(Store *store, uint32_t index)
  * Public Structured Query:
  *   DatabaseResult *Database_queryEqual(Database *self, const char *entity,
  *       const char *field, const void *value, size_t valueLength)
+ * Store catalog discovery returns a copied DatabaseCatalogEntry value; its
+ * name/stride/count remain valid after Store close. A requested out-of-range
+ * position returns DATABASE_ABSENT and a cold diagnostic.
  * Public Diagnostics: (.h) _errorCode, _lastError, _errorText
  * Public String Projections: (.h) _toString / _toStringStruct
  * CONTRACT: schemas and borrowed rows outlive Database; owned rows are copied
@@ -1463,6 +1467,141 @@ int32_t Database_loadStore(Database *self, Store *store) {
     }
     recordError(self, DATABASE_OK, "");
     return DATABASE_OK;
+}
+
+/** Reads one validated persisted entity descriptor as an owned value record. */
+DatabaseCatalogEntry Database_storeCatalogEntry(Store *store, uint32_t wantedIndex) {
+    DatabaseCatalogEntry result;
+    memset(&result, 0, sizeof(result));
+    result.code = DATABASE_INVALID;
+    if (store == nullptr || !Store_isOpen(store)) {
+        THROW("Database_storeCatalogEntry: invalid or closed store");
+        return result;
+    }
+    uint32_t pageSize = Store_pageSize(store);
+    uint32_t pageCount = Store_pageCount(store);
+    size_t chunkCapacity = (size_t) pageSize - PAGE_HEADER_BYTES -
+        sizeof(DatabaseStoreLink);
+    size_t maxBytes = pageCount > 1u ? (size_t) (pageCount - 1u) * chunkCapacity : 0u;
+    uint8_t *pageBytes = (uint8_t*) Memory_alloc(0u, pageSize);
+    if (pageBytes == nullptr) {
+        result.code = DATABASE_EXHAUSTED;
+        THROW("Database_storeCatalogEntry: page buffer allocation failed");
+        return result;
+    }
+    DatabaseStoreRoot root;
+    bool rootValid = databaseStoreReadRoot(store, pageBytes, &root);
+    if (!rootValid || root.length == 0u ||
+        (uint64_t) (size_t) root.length != root.length || root.length > maxBytes) {
+        Memory_free(pageBytes);
+        result.code = DATABASE_CORRUPT;
+        THROW("Database_storeCatalogEntry: root page is absent or invalid");
+        return result;
+    }
+    size_t length = (size_t) root.length;
+    uint8_t *bytes = (uint8_t*) Memory_alloc(0u, length);
+    if (bytes == nullptr) {
+        Memory_free(pageBytes);
+        result.code = DATABASE_EXHAUSTED;
+        THROW("Database_storeCatalogEntry: catalog allocation failed");
+        return result;
+    }
+    size_t offset = 0u;
+    uint32_t pageId = root.firstPage;
+    uint32_t visited = 0u;
+    bool valid = pageId != 0u;
+    while (valid && offset < length) {
+        if (pageId == 0u || pageId > pageCount || visited++ >= pageCount) {
+            valid = false;
+            break;
+        }
+        uint32_t used = 0u;
+        uint32_t kind = 0u;
+        bool truncated = false;
+        StoreCode code = Store_page_read(store, pageId, pageBytes, pageSize,
+            &used, &kind, &truncated);
+        if (code != STORE_OK || truncated || kind != PAGE_KIND_LEAF ||
+            used < sizeof(DatabaseStoreLink)) {
+            valid = false;
+            break;
+        }
+        DatabaseStoreLink link;
+        memcpy(&link, pageBytes, sizeof(link));
+        if (link.offset != offset || link.chunkBytes != used - sizeof(link) ||
+            link.chunkBytes == 0u || link.chunkBytes > length - offset) {
+            valid = false;
+            break;
+        }
+        memcpy(bytes + offset, pageBytes + sizeof(link), link.chunkBytes);
+        offset += link.chunkBytes;
+        pageId = link.nextPage;
+    }
+    Memory_free(pageBytes);
+    valid = valid && offset == length && pageId == 0u &&
+        Crc32_finalize(Crc32_update(CRC32_SEED, bytes, length)) == root.crc;
+    if (!valid || length < sizeof(DatabaseStoreCatalog)) {
+        Memory_free(bytes);
+        result.code = DATABASE_CORRUPT;
+        THROW("Database_storeCatalogEntry: page chain or checksum rejected");
+        return result;
+    }
+    DatabaseStoreCatalog catalog;
+    memcpy(&catalog, bytes, sizeof(catalog));
+    if (memcmp(catalog.magic, DATABASE_STORE_CATALOG_MAGIC,
+            sizeof(catalog.magic)) != 0 || catalog.version != DATABASE_STORE_VERSION ||
+        (size_t) catalog.entityCount > (length - sizeof(catalog)) /
+            sizeof(DatabaseStoreEntity)) {
+        Memory_free(bytes);
+        result.code = DATABASE_CORRUPT;
+        THROW("Database_storeCatalogEntry: catalog header rejected");
+        return result;
+    }
+    size_t recordOffset = sizeof(catalog);
+    bool found = false;
+    for (uint32_t i = 0u; i < catalog.entityCount; i++) {
+        if (recordOffset > length || length - recordOffset < sizeof(DatabaseStoreEntity)) {
+            valid = false;
+            break;
+        }
+        DatabaseStoreEntity record;
+        memcpy(&record, bytes + recordOffset, sizeof(record));
+        recordOffset += sizeof(record);
+        if (record.stride == 0u ||
+            memchr(record.name, '\0', sizeof(record.name)) == nullptr ||
+            (size_t) record.rowCount > SIZE_MAX / record.stride) {
+            valid = false;
+            break;
+        }
+        size_t rowBytes = (size_t) record.rowCount * record.stride;
+        if (rowBytes > length - recordOffset) {
+            valid = false;
+            break;
+        }
+        if (i == wantedIndex) {
+            memcpy(result.name, record.name, sizeof(result.name));
+            result.rowStride = record.stride;
+            result.rowCount = record.rowCount;
+            result.found = true;
+            found = true;
+        }
+        recordOffset += rowBytes;
+    }
+    valid = valid && recordOffset == length;
+    Memory_free(bytes);
+    if (!valid) {
+        memset(&result, 0, sizeof(result));
+        result.code = DATABASE_CORRUPT;
+        THROW("Database_storeCatalogEntry: catalog records rejected");
+        return result;
+    }
+    if (!found) {
+        memset(&result, 0, sizeof(result));
+        result.code = DATABASE_ABSENT;
+        THROW("Database_storeCatalogEntry: catalog index is absent");
+        return result;
+    }
+    result.code = DATABASE_OK;
+    return result;
 }
 
 // STRING PROJECTIONS (the toString Law)
