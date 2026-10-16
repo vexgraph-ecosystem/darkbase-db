@@ -7,6 +7,7 @@
 
 #include "c23/constructor.h"
 #include "database/database_catalog_entry.h"
+#include "database/database_field_span.h"
 #include "database/database_result.h"
 #include "reflection/struct.h"
 #include "struct/chunked_list.h"
@@ -109,6 +110,17 @@ DatabaseResult *Database_queryEqual(Database *self, const char *entity,
 DatabaseResult *Database_queryInt32Range(Database *self, const char *entity,
                                          const char *field, int32_t minimum,
                                          int32_t maximum);
+
+// --- Named field resolution ---
+// Where the NAMED field's Bytes live inside this entity's rows, so a caller
+// without the C struct can read one. Resolves against the registered schema and
+// folds the requested name, so case does not matter; a null or ambiguous name
+// rejects rather than guessing, and a span that would leave the row is refused
+// rather than returned. Read-only: it neither allocates nor disturbs an index.
+// Result code is DATABASE_OK, DATABASE_ABSENT (unknown entity or field) or
+// DATABASE_INVALID (null/malformed/ambiguous/out-of-row).
+DatabaseFieldSpan Database_fieldSpan(const Database *self, const char *entity,
+                                     const char *field);
 
 // --- In-memory integer index ---
 // Build the int32 index for one field of an entity: the Field must carry

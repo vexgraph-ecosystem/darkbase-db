@@ -141,6 +141,7 @@
  * Public Core Functions: (.h) _kind, _check, _define, _entityIndex, _entityCount,
  *                             _schema, _insert, _insertOwned, _row, _count, _select,
  *                             _queryEqual, _queryInt32Range, _indexBuild, _indexed
+ *                             _fieldSpan
  * Public Persistence: (.h) _save, _load
  *                      _saveStore, _loadStore (caller-owned page Store)
  *   int32_t Database_saveStore(Database *self, Store *store)
@@ -346,7 +347,7 @@ static bool indexRebuild(Database *self, DbEntity *entity) {
 }
 
 /** Resolve one requested field name to its span within the entity's schema. */
-static DbFieldSpan resolveField(DbEntity *entity, const char *fieldName) {
+static DbFieldSpan resolveField(const DbEntity *entity, const char *fieldName) {
     DbFieldSpan span = { DATABASE_ABSENT, nullptr, 0u, 0u };
     if (entity == nullptr || (*entity).schema == nullptr)
         return span;
@@ -1028,6 +1029,53 @@ bool Database_indexed(const Database *self, const char *entityName, const char *
     if (entity == nullptr || (*entity).indexField[0] == '\0')
         return false;
     return strcmp((*entity).indexField, foldedField) == 0;
+}
+
+// NAMED FIELD RESOLUTION
+
+/**
+ * Resolve a field NAME to its in-row byte span, for a consumer that has no C
+ * struct to take the offset from. Read-only: it allocates nothing, disturbs no
+ * index, and preserves prior state on every rejection.
+ */
+DatabaseFieldSpan Database_fieldSpan(const Database *self, const char *entityName,
+                                     const char *fieldName) {
+    DatabaseFieldSpan span = { DATABASE_INVALID, 0u, 0u };
+    if (self == nullptr || entityName == nullptr || fieldName == nullptr) {
+        THROW("Database_fieldSpan: null argument");
+        return span;
+    }
+    int32_t index = Database_entityIndex(self, entityName);
+    if (index < 0) {
+        span.code = DATABASE_ABSENT;
+        THROW("Database_fieldSpan: no such entity");
+        return span;
+    }
+    const DbEntity *entity = (const DbEntity*) ChunkedList_slot((*self).entities,
+                                                               (uint32_t) index);
+    if (entity == nullptr || (*entity).schema == nullptr) {
+        span.code = DATABASE_ABSENT;
+        THROW("Database_fieldSpan: no such entity");
+        return span;
+    }
+    DbFieldSpan resolved = resolveField(entity, fieldName);
+    if (resolved.code != DATABASE_OK) {
+        span.code = resolved.code;
+        THROW("Database_fieldSpan: field did not resolve");
+        return span;
+    }
+    // Never hand back a span that leaves the row: the caller will read it.
+    uint32_t stride = Struct_getSize((*entity).schema);
+    if (resolved.size == 0u || resolved.offset > stride ||
+        resolved.size > stride - resolved.offset) {
+        span.code = DATABASE_INVALID;
+        THROW("Database_fieldSpan: field span leaves the row");
+        return span;
+    }
+    span.code = DATABASE_OK;
+    span.offset = resolved.offset;
+    span.size = resolved.size;
+    return span;
 }
 
 // DIAGNOSTICS
