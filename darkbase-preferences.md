@@ -239,7 +239,14 @@ index keeps its local declaration and rebuilds on the next query. This is still 
 whole-image rewrite, not incremental index pages: no page-level index, no ordered
 scan of other field types, and no multi-field index.
 
-`Database_storeCatalogEntry` returns one copied persisted entity descriptor by
+`Database_fieldSpan` resolves one field NAME to its in-row byte span
+(`{code, offset, size}`), so a consumer that has no C struct — a headless
+service, a tool, any schema-driven reader — can read a field without walking the
+reflection tree and folding names itself. The name is folded, so case is
+irrelevant; a null, unknown or ambiguous name rejects explicitly, and a declared
+span that would leave the row is refused rather than handed to a reader. It is
+read-only: it allocates nothing and disturbs no index. This is named-field
+resolution, not projection: no field list, no computed values, no row shaping.
 catalog index after validating the root, page chain, checksum and record spans.
 The value contains name, row stride and row count and does not borrow Store
 memory. It supports discovery only; loading data still requires the caller to
